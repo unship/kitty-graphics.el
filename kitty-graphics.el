@@ -135,12 +135,48 @@ Useful for debugging and batch testing without a real terminal.")
               (forward-line 500)
               (delete-region (point-min) (point)))))))))
 
+(defcustom kitty-gfx-tmux-passthrough t
+  "When non-nil, wrap Kitty graphics APC sequences with the tmux DCS
+passthrough envelope inside tmux.  Required for the Kitty protocol to
+traverse tmux when `allow-passthrough' is on.  Plain CSI sequences and
+text bytes are never wrapped — tmux handles those natively and needs to
+see them to keep its own grid in sync.  Sixel DCS is also left unwrapped
+because tmux 3.4+ renders Sixel itself.  Set to nil to disable entirely."
+  :type 'boolean
+  :group 'kitty-gfx)
+
+(defun kitty-gfx--wrap-tmux-passthrough (str)
+  "Wrap STR with tmux DCS passthrough envelope.
+Doubles every ESC in STR and surrounds with `\\ePtmux;' ... `\\e\\\\'.
+Requires `allow-passthrough on' in tmux for the outer terminal to
+actually see the unwrapped payload."
+  (concat "\ePtmux;"
+          (replace-regexp-in-string "\e" "\e\e" str t t)
+          "\e\\"))
+
+(defun kitty-gfx--needs-tmux-wrap-p (str)
+  "Return non-nil if STR contains a Kitty graphics APC that tmux would eat.
+Only APC sequences starting with `\\e_G' (the Kitty graphics indicator)
+need the passthrough wrapper; plain CSI movement, SGR, OSC, and raw
+text all pass through tmux untouched and must NOT be wrapped (tmux
+needs them to update its own grid for tmux-window-switch correctness)."
+  (and kitty-gfx-tmux-passthrough
+       (kitty-gfx--frame-getenv "TMUX")
+       (string-match-p "\e_G" str)))
+
 (defun kitty-gfx--terminal-send (str)
   "Send STR to terminal, or log it in dry-run mode.
-All terminal escape output should go through this function."
-  (if kitty-gfx--dry-run
-      (kitty-gfx--log "DRY-RUN-SEND: %S" str)
-    (ignore-errors (send-string-to-terminal str))))
+All terminal escape output should go through this function.
+
+Inside tmux, Kitty graphics APC sequences are wrapped with the tmux DCS
+passthrough envelope so they reach the outer terminal.  Everything else
+is emitted raw."
+  (let ((payload (if (kitty-gfx--needs-tmux-wrap-p str)
+                     (kitty-gfx--wrap-tmux-passthrough str)
+                   str)))
+    (if kitty-gfx--dry-run
+        (kitty-gfx--log "DRY-RUN-SEND: %S" payload)
+      (ignore-errors (send-string-to-terminal payload)))))
 
 ;;;; Constants — kept for reference if switching back to Unicode placeholders
 ;; (defconst kitty-gfx--placeholder-char #x10EEEE)
@@ -562,14 +598,24 @@ env otherwise."
 (defun kitty-gfx--kitty-detect ()
   "Return non-nil if the terminal supports Kitty graphics protocol.
 Reads env vars via `kitty-gfx--frame-getenv' so emacs --daemon
-clients see the attached terminal's environment."
+clients see the attached terminal's environment.
+
+Inside tmux `TERM_PROGRAM' is masked to \"tmux\", so we also accept
+terminal-specific env markers (e.g. `GHOSTTY_RESOURCES_DIR') as
+evidence that the outer terminal speaks the Kitty protocol."
   (let* ((frame (selected-frame))
          (kitty-pid (kitty-gfx--frame-getenv "KITTY_PID" frame))
          (term-prog (kitty-gfx--frame-getenv "TERM_PROGRAM" frame))
+         (ghostty (or (kitty-gfx--frame-getenv "GHOSTTY_RESOURCES_DIR" frame)
+                      (kitty-gfx--frame-getenv "GHOSTTY_BIN_DIR" frame)))
+         (wezterm (kitty-gfx--frame-getenv "WEZTERM_EXECUTABLE" frame))
          (supported (or kitty-pid
+                        ghostty
+                        wezterm
                         (member term-prog '("kitty" "WezTerm" "ghostty")))))
-    (kitty-gfx--log "kitty-detect: %s (KITTY_PID=%s TERM_PROGRAM=%s)"
-                     supported kitty-pid term-prog)
+    (kitty-gfx--log "kitty-detect: %s (KITTY_PID=%s TERM_PROGRAM=%s GHOSTTY=%s WEZTERM=%s)"
+                     supported kitty-pid term-prog
+                     (if ghostty "set" "no") (if wezterm "set" "no"))
     supported))
 
 (defun kitty-gfx--kitty-prepare (file image-id)
