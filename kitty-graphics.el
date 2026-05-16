@@ -2055,7 +2055,8 @@ When KEEP-PLACEMENT is non-nil, skip the terminal-side delete so
 the placement ID can be reused by a subsequent overlay (avoids
 visual glitches from delete+re-place sequences in some terminals)."
   (let ((id (overlay-get ov 'kitty-gfx-id))
-        (pid (overlay-get ov 'kitty-gfx-pid)))
+        (pid (overlay-get ov 'kitty-gfx-pid))
+        (temp-file (overlay-get ov 'kitty-gfx-delete-file)))
     (when keep-placement
       (overlay-put ov 'kitty-gfx-placements nil))
     (kitty-gfx--log "remove-overlay: id=%s pid=%s keep=%s buf=%s"
@@ -2065,6 +2066,8 @@ visual glitches from delete+re-place sequences in some terminals)."
       (unless keep-placement
         (kitty-gfx--delete-image-placements ov))
       (delete-overlay ov))
+    (when temp-file
+      (ignore-errors (delete-file temp-file)))
     (setq kitty-gfx--overlays (delq ov kitty-gfx--overlays))
     (kitty-gfx--log "remove-overlay: done (remaining=%d)" (length kitty-gfx--overlays))))
 
@@ -2101,9 +2104,10 @@ BEG/END span the overlay region.  MAX-COLS/MAX-ROWS limit size."
         (kitty-gfx--cache-put abs-file image-id)))
     ;; Create overlay with blank space (even for cached images, dims are fresh)
     (when (or cached-id (gethash abs-file kitty-gfx--image-cache))
-      (kitty-gfx--make-overlay start stop image-id cols rows abs-file)
-      ;; Schedule initial render
-      (kitty-gfx--schedule-refresh))))
+      (let ((ov (kitty-gfx--make-overlay start stop image-id cols rows abs-file)))
+        ;; Schedule initial render
+        (kitty-gfx--schedule-refresh)
+        ov))))
 
 (defun kitty-gfx--display-image-centered (file max-cols max-rows
                                                 &optional win-cols win-rows
@@ -2881,20 +2885,26 @@ SPEC is an image descriptor — typically a create-image result.
 We extract the :file or :data from the image properties."
   (if (and kitty-graphics-mode (not (display-graphic-p)))
       (let* ((start (point))
-             ;; shr image spec is (image . PROPS) from `create-image'
+             ;; Accept SHR's raw DATA/(DATA CONTENT-TYPE) form, with
+             ;; image-spec plist handling as a fallback for other callers.
              (props (and (consp spec) (cdr spec)))
-             (data (plist-get props :data))
+             (data (cond
+                    ((stringp spec) spec)
+                    ((and (consp spec) (stringp (car spec))) (car spec))
+                    (t (plist-get props :data))))
              (url (plist-get props :file))
-             (type (plist-get props :type)))
+             (type (if (and (consp spec) (stringp (car spec)))
+                       (cadr spec)
+                     (plist-get props :type))))
         (kitty-gfx--log "shr-put-image: type=%s url=%s data-len=%s alt=%s"
                          type url (when data (length data)) alt)
         (insert (or alt "[image]"))
         (let ((end (point)))
           (let* ((suffix (cond
-                          ((eq type 'jpeg) ".jpg")
-                          ((eq type 'gif) ".gif")
-                          ((eq type 'webp) ".webp")
-                          ((eq type 'svg) ".svg")
+                          ((member type '(jpeg image/jpeg "image/jpeg")) ".jpg")
+                          ((member type '(gif image/gif "image/gif")) ".gif")
+                          ((member type '(webp image/webp "image/webp")) ".webp")
+                          ((member type '(svg image/svg+xml "image/svg+xml")) ".svg")
                           (t ".png")))
                  (file (cond
                         (url (when (file-exists-p url) url))
@@ -2905,14 +2915,17 @@ We extract the :file or :data from the image properties."
                              (insert data))
                            tmp))))
                  (temp-p (and data file)))
-            (unwind-protect
-                (condition-case err
-                    (when file
-                      (kitty-gfx-display-image file start end))
-                  (error
-                   (kitty-gfx--log "shr-put-image error: %s" (error-message-string err))))
-              (when temp-p
-                (ignore-errors (delete-file file)))))))
+            (condition-case err
+                (when file
+                  (let ((ov (kitty-gfx-display-image file start end)))
+                    (if (and ov temp-p)
+                        (overlay-put ov 'kitty-gfx-delete-file file)
+                      (when temp-p
+                        (ignore-errors (delete-file file))))))
+              (error
+               (when temp-p
+                 (ignore-errors (delete-file file)))
+               (kitty-gfx--log "shr-put-image error: %s" (error-message-string err)))))))
     (apply orig-fn spec alt args)))
 
 ;;;; doc-view integration
@@ -3668,10 +3681,13 @@ and image-mode simultaneously)."
       (dolist (ov kitty-gfx--overlays)
         (condition-case nil
             (let ((id (overlay-get ov 'kitty-gfx-id))
-                  (pid (overlay-get ov 'kitty-gfx-pid)))
+                  (pid (overlay-get ov 'kitty-gfx-pid))
+                  (temp-file (overlay-get ov 'kitty-gfx-delete-file)))
               (when (and id pid kitty-gfx--active-backend)
                 ;; Always delete the placement (it's buffer-specific)
                 (funcall (kitty-gfx--backend-fn 'delete) ov id pid))
+              (when temp-file
+                (ignore-errors (delete-file temp-file)))
               ;; Only delete the image data if no other buffer uses it
               (when (and id (not (memq id deleted-ids)))
                 (if (kitty-gfx--image-id-in-other-buffers-p id)
