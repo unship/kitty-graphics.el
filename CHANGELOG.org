@@ -1,5 +1,73 @@
 * Changelog
 
+** Unreleased
+
+*** Features
+
+**** Kitty graphics protocol inside tmux
+
+Two pieces together let the Kitty backend work through tmux DCS
+passthrough end-to-end — the half left open in =0.5.0= (see #2).
+
+***** tmux DCS passthrough wrap + Ghostty detection
+
+Inside tmux, Kitty graphics APC sequences (=ESC _ G ... ESC \=) are
+stripped by tmux before reaching the outer terminal.  =kitty-gfx--
+terminal-send= now wraps payloads that contain a =\e_G= APC with
+the standard =\ePtmux;<doubled-ESC>\e\\= envelope so they pass
+through when =allow-passthrough on= is set.  Plain CSI, SGR, OSC,
+and text remain unwrapped — tmux handles those natively and needs
+to see them to keep its own grid in sync.
+
+New custom: =kitty-gfx-tmux-passthrough= (default =t=).
+
+The Kitty-backend detector previously matched on =TERM_PROGRAM=,
+which tmux masks to =tmux=, so terminals like Ghostty went
+unrecognised inside a multiplexer.  =kitty-gfx--kitty-detect= now
+also accepts =GHOSTTY_RESOURCES_DIR= / =GHOSTTY_BIN_DIR= and
+=WEZTERM_EXECUTABLE= as evidence the outer terminal speaks the
+protocol.
+
+***** Unicode placeholder placement (no ghost on pane switch)
+
+Adds the Kitty graphics protocol's Unicode-placeholder placement
+mode as an alternative to the existing absolute =a=p,c,r= form.
+Placeholder cells (=U+10EEEE= + row/col diacritics, fg color
+encoding the image id) live in the multiplexer's character grid as
+ordinary text, so pane / window switches and buffer scrolling are
+handled by the multiplexer naturally — there is no terminal-side
+pixel-layer ghost to clean up.
+
+New custom: =kitty-gfx-kitty-placement-mode= with values =auto=
+(default), =direct=, =placeholder=.  =auto= resolves to
+=placeholder= inside tmux and =direct= otherwise.
+
+Implementation notes that may be relevant to anyone porting this to
+another Emacs image package:
+
+- Emacs' TTY display engine drops combining diacritics that attach
+  to private-use base characters such as =U+10EEEE=, which would
+  silently break the protocol if placeholder cells went through
+  =display= properties.  The actual placeholder bytes are written
+  via =send-string-to-terminal= from
+  =kitty-gfx--emit-placeholder-cells=; the overlay's =display=
+  string still reserves screen real estate as blank cells, so the
+  terminal has somewhere consistent to paint.
+- =a=T,U=1= (transmit-and-virtual-place in one APC) caused
+  Ghostty 1.3.x to also draw the image once at the cursor position
+  at transmit time, producing a ghost copy.  Splitting into =a=t=
+  + a separate =a=p,U=1= avoids the cursor-position render.
+- =U+10EEEE='s default east-asian width is 2; the protocol
+  requires width-1 cells.  =char-width-table= is pinned to 1 for
+  that code point at load time.
+- When an overlay moves (or is deleted) the cells it previously
+  occupied are overwritten with spaces, otherwise the image
+  continues rendering at the stale location in the multiplexer's
+  grid.  The image data on the terminal side is kept either way so
+  a re-place does not require a re-transmit.
+
+Refs #2.
+
 ** kitty-graphics 0.5.0
 
 A feature-heavy follow-up to =0.4.0=: typst inline equations, a much

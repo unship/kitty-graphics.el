@@ -135,16 +135,194 @@ Useful for debugging and batch testing without a real terminal.")
               (forward-line 500)
               (delete-region (point-min) (point)))))))))
 
+(defcustom kitty-gfx-tmux-passthrough t
+  "When non-nil, wrap Kitty graphics APC sequences with the tmux DCS
+passthrough envelope inside tmux.  Required for the Kitty protocol to
+traverse tmux when `allow-passthrough' is on.  Plain CSI sequences and
+text bytes are never wrapped — tmux handles those natively and needs to
+see them to keep its own grid in sync.  Sixel DCS is also left unwrapped
+because tmux 3.4+ renders Sixel itself.  Set to nil to disable entirely."
+  :type 'boolean
+  :group 'kitty-gfx)
+
+(defcustom kitty-gfx-kitty-placement-mode 'auto
+  "Placement strategy for the Kitty graphics backend.
+
+- `direct' — emit an `a=p,c,r' APC at the image's terminal-screen
+  coordinates.  Simple and broadly supported, but inside a terminal
+  multiplexer the image lives in the outer terminal's pixel layer
+  where the multiplexer cannot evict it, so the image ghosts on pane
+  / window switches.
+
+- `placeholder' — use the Kitty graphics protocol's Unicode
+  placeholder mode.  Transmit the image with `a=t' (store only),
+  register a virtual placement with `a=p,U=1', and write `U+10EEEE'
+  cells with row/column diacritics plus an image-id-encoded SGR
+  foreground into the area the overlay covers.  Those cells live in
+  the multiplexer's character grid as regular text, so window
+  switches and buffer scrolling are handled by the multiplexer
+  naturally; no ghost survives.  Requires the outer terminal to
+  implement the placeholder protocol — verified on kitty.app and
+  Ghostty 1.3+; other terminals may need additional work.
+
+- `auto' (default) — `placeholder' when running inside tmux (where
+  the ghost problem is worst), `direct' otherwise."
+  :type '(choice (const :tag "Auto (placeholder inside tmux, direct otherwise)" auto)
+                 (const :tag "Direct screen placement (a=p,c,r)" direct)
+                 (const :tag "Unicode placeholder (U=1)" placeholder))
+  :group 'kitty-gfx)
+
+(defun kitty-gfx--wrap-tmux-passthrough (str)
+  "Wrap STR with tmux DCS passthrough envelope.
+Doubles every ESC in STR and surrounds with `\\ePtmux;' ... `\\e\\\\'.
+Requires `allow-passthrough on' in tmux for the outer terminal to
+actually see the unwrapped payload."
+  (concat "\ePtmux;"
+          (replace-regexp-in-string "\e" "\e\e" str t t)
+          "\e\\"))
+
+(defun kitty-gfx--needs-tmux-wrap-p (str)
+  "Return non-nil if STR contains a Kitty graphics APC that tmux would eat.
+Only APC sequences starting with `\\e_G' (the Kitty graphics indicator)
+need the passthrough wrapper; plain CSI movement, SGR, OSC, and raw
+text all pass through tmux untouched and must NOT be wrapped (tmux
+needs them to update its own grid for tmux-window-switch correctness)."
+  (and kitty-gfx-tmux-passthrough
+       (kitty-gfx--frame-getenv "TMUX")
+       (string-match-p "\e_G" str)))
+
 (defun kitty-gfx--terminal-send (str)
   "Send STR to terminal, or log it in dry-run mode.
-All terminal escape output should go through this function."
-  (if kitty-gfx--dry-run
-      (kitty-gfx--log "DRY-RUN-SEND: %S" str)
-    (ignore-errors (send-string-to-terminal str))))
+All terminal escape output should go through this function.
 
-;;;; Constants — kept for reference if switching back to Unicode placeholders
-;; (defconst kitty-gfx--placeholder-char #x10EEEE)
-;; (defconst kitty-gfx--diacritics [...])
+Inside tmux, Kitty graphics APC sequences are wrapped with the tmux DCS
+passthrough envelope so they reach the outer terminal.  Everything else
+is emitted raw."
+  (let ((payload (if (kitty-gfx--needs-tmux-wrap-p str)
+                     (kitty-gfx--wrap-tmux-passthrough str)
+                   str)))
+    (if kitty-gfx--dry-run
+        (kitty-gfx--log "DRY-RUN-SEND: %S" payload)
+      (ignore-errors (send-string-to-terminal payload)))))
+
+;;;; Unicode placeholder protocol constants
+
+(defconst kitty-gfx--placeholder-char ?\x10EEEE
+  "Base code point of a Kitty graphics Unicode placeholder cell.
+Each rendered cell consists of this character followed by two
+combining marks from `kitty-gfx--diacritics' encoding the (row,
+col) into the image, with the cell's truecolor SGR foreground
+encoding the image identifier.  See the Kitty graphics protocol's
+Unicode-placeholder section for the exact rules.")
+
+;; The placeholder code point lives in the Supplementary Private Use
+;; Area-B.  Emacs' default Unicode width tables classify it as 2-wide,
+;; but the protocol mandates one cell per placeholder.  Pinning the
+;; width to 1 at load time keeps every (PH + row-dia + col-dia) triple
+;; on a single terminal cell — without this, the overlay's reserved
+;; blank area and the placeholder cells we paint over it disagree on
+;; cell count, stretching or wrapping the image.
+(set-char-table-range char-width-table kitty-gfx--placeholder-char 1)
+
+(defconst kitty-gfx--diacritics
+  [#x0305  #x030D  #x030E  #x0310  #x0312  #x033D  #x033E  #x033F
+   #x0346  #x034A  #x034B  #x034C  #x0350  #x0351  #x0352  #x0357
+   #x035B  #x0363  #x0364  #x0365  #x0366  #x0367  #x0368  #x0369
+   #x036A  #x036B  #x036C  #x036D  #x036E  #x036F  #x0483  #x0484
+   #x0485  #x0486  #x0487  #x0592  #x0593  #x0594  #x0595  #x0597
+   #x0598  #x0599  #x059C  #x059D  #x059E  #x059F  #x05A0  #x05A1
+   #x05A8  #x05A9  #x05AB  #x05AC  #x05AF  #x05C4  #x0610  #x0611
+   #x0612  #x0613  #x0614  #x0615  #x0616  #x0617  #x0657  #x0658
+   #x0659  #x065A  #x065B  #x065D  #x065E  #x06D6  #x06D7  #x06D8
+   #x06D9  #x06DA  #x06DB  #x06DC  #x06DF  #x06E0  #x06E1  #x06E2
+   #x06E4  #x06E7  #x06E8  #x06EB  #x06EC  #x0730  #x0732  #x0733
+   #x0735  #x0736  #x073A  #x073D  #x073F  #x0740  #x0741  #x0743
+   #x0745  #x0747  #x0749  #x074A  #x07EB  #x07EC  #x07ED  #x07EE
+   #x07EF  #x07F0  #x07F1  #x07F3  #x0816  #x0817  #x0818  #x0819
+   #x081B  #x081C  #x081D  #x081E  #x081F  #x0820  #x0821  #x0822
+   #x0823  #x0825  #x0826  #x0827  #x0829  #x082A  #x082B  #x082C
+   #x082D  #x0951  #x0953  #x0954  #x0F82  #x0F83  #x0F86  #x0F87
+   #x135D  #x135E  #x135F  #x17DD  #x193A  #x1A17  #x1A75  #x1A76
+   #x1A77  #x1A78  #x1A79  #x1A7A  #x1A7B  #x1A7C  #x1B6B  #x1B6D
+   #x1B6E  #x1B6F  #x1B70  #x1B71  #x1B72  #x1B73  #x1CD0  #x1CD1
+   #x1CD2  #x1CDA  #x1CDB  #x1CE0  #x1DC0  #x1DC1  #x1DC3  #x1DC4
+   #x1DC5  #x1DC6  #x1DC7  #x1DC8  #x1DC9  #x1DCB  #x1DCC  #x1DD1
+   #x1DD2  #x1DD3  #x1DD4  #x1DD5  #x1DD6  #x1DD7  #x1DD8  #x1DD9
+   #x1DDA  #x1DDB  #x1DDC  #x1DDD  #x1DDE  #x1DDF  #x1DE0  #x1DE1
+   #x1DE2  #x1DE3  #x1DE4  #x1DE5  #x1DE6  #x1DFE  #x20D0  #x20D1
+   #x20D4  #x20D5  #x20D6  #x20D7  #x20DB  #x20DC  #x20E1  #x20E7
+   #x20E9  #x20F0  #x2CEF  #x2CF0  #x2CF1  #x2DE0  #x2DE1  #x2DE2
+   #x2DE3  #x2DE4  #x2DE5  #x2DE6  #x2DE7  #x2DE8  #x2DE9  #x2DEA
+   #x2DEB  #x2DEC  #x2DED  #x2DEE  #x2DEF  #x2DF0  #x2DF1  #x2DF2
+   #x2DF3  #x2DF4  #x2DF5  #x2DF6  #x2DF7  #x2DF8  #x2DF9  #x2DFA
+   #x2DFB  #x2DFC  #x2DFD  #x2DFE  #x2DFF  #xA66F  #xA67C  #xA67D
+   #xA6F0  #xA6F1  #xA8E0  #xA8E1  #xA8E2  #xA8E3  #xA8E4  #xA8E5
+   #xA8E6  #xA8E7  #xA8E8  #xA8E9  #xA8EA  #xA8EB  #xA8EC  #xA8ED
+   #xA8EE  #xA8EF  #xA8F0  #xA8F1  #xAAB0  #xAAB2  #xAAB3  #xAAB7
+   #xAAB8  #xAABE  #xAABF  #xAAC1  #xFE20  #xFE21  #xFE22  #xFE23
+   #xFE24  #xFE25  #xFE26  #x10A0F #x10A38 #x1D185 #x1D186 #x1D187
+   #x1D188 #x1D189 #x1D1AA #x1D1AB #x1D1AC #x1D1AD #x1D242 #x1D243
+   #x1D244]
+  "297 combining-mark code points used by the Kitty graphics Unicode
+placeholder protocol to encode row/column indices.  Cell (Y, X) of an
+image is referenced by appending `(aref kitty-gfx--diacritics Y)' then
+`(aref kitty-gfx--diacritics X)' after `kitty-gfx--placeholder-char'.
+Hard limit: images > 297 cells in either dimension cannot use this
+mode.  Order is significant — do not sort.")
+
+(defun kitty-gfx--effective-placement-mode ()
+  "Resolve `kitty-gfx-kitty-placement-mode' to `direct' or `placeholder'.
+The `auto' value chooses `placeholder' inside tmux (where direct
+placement leaks images across pane switches) and `direct' outside
+\(where direct is simpler and the ghost problem does not apply)."
+  (pcase kitty-gfx-kitty-placement-mode
+    ('direct 'direct)
+    ('placeholder 'placeholder)
+    (_ (if (kitty-gfx--frame-getenv "TMUX") 'placeholder 'direct))))
+
+(defun kitty-gfx--emit-placeholder-cells (image-id cols rows term-row term-col)
+  "Emit a COLS x ROWS block of Kitty Unicode placeholder cells.
+
+Bytes are written via `kitty-gfx--terminal-send' rather than going
+through Emacs's display engine: Emacs strips combining diacritics
+attached to private-use base characters such as U+10EEEE, which
+would silently break the protocol.  Calling this from a TTY display
+context is therefore correct only when something else (an overlay
+display string, in our case) has already reserved the screen cells.
+
+Each cell encodes the image identifier via the truecolor SGR
+foreground and the cell's image-relative (row, col) via two
+combining diacritics from `kitty-gfx--diacritics'.  IMAGE-ID must
+fit in 24 bits; the protocol's optional fourth combining character
+for an extra MSB byte is not produced here.
+
+TERM-ROW and TERM-COL are 1-based terminal coordinates of the
+image area's top-left.  The emission is bracketed by DECSC/DECRC
+\(`\\e7' / `\\e8') so the caller's cursor and SGR state are
+preserved."
+  (let ((max (length kitty-gfx--diacritics)))
+    (cond
+     ((> image-id #xffffff)
+      (error "kitty-gfx: image id %d exceeds 24 bits — \
+placeholder mode cannot encode it" image-id))
+     ((or (> rows max) (> cols max))
+      (error "kitty-gfx: image %dx%d cells exceeds the %d-entry placeholder grid"
+             cols rows max))))
+  (let* ((sgr (format "\e[38;2;%d;%d;%dm"
+                      (logand (ash image-id -16) #xff)
+                      (logand (ash image-id -8)  #xff)
+                      (logand image-id           #xff)))
+         (ph (string kitty-gfx--placeholder-char))
+         (parts (list "\e7" sgr)))
+    (dotimes (y rows)
+      (push (format "\e[%d;%dH" (+ term-row y) term-col) parts)
+      (let ((row-dia (string (aref kitty-gfx--diacritics y))))
+        (dotimes (x cols)
+          (push ph parts)
+          (push row-dia parts)
+          (push (string (aref kitty-gfx--diacritics x)) parts))))
+    (push "\e[0m\e8" parts)
+    (kitty-gfx--terminal-send (mapconcat #'identity (nreverse parts) ""))))
 
 ;;;; Internal state
 
@@ -486,17 +664,27 @@ Flushes buffered output to the terminal all at once."
 ;;;; Protocol layer
 
 (defun kitty-gfx--transmit-image (id base64-data)
-  "Transmit image data to terminal with `a=t' (store only, no display).
-ID is the image ID to assign.  BASE64-DATA is the PNG data, base64-encoded.
-After this call, the image is stored in the terminal and can be placed
-with `kitty-gfx--place-image'."
-  (let* ((chunk-size kitty-gfx-chunk-size)
+  "Transmit image data with `a=t' (store-only) under image id ID.
+BASE64-DATA is the PNG bytes, base64-encoded.  Chunked into
+`kitty-gfx-chunk-size'-byte pieces using `m=1/0' continuation
+markers per the Kitty graphics protocol.
+
+This call only stores the image; how it is later rendered depends
+on the active placement mode:
+
+- `direct': `kitty-gfx--place-image' later emits an `a=p,c,r' APC
+  at screen coordinates.
+- `placeholder': `kitty-gfx--register-virtual-placement' is called
+  immediately below to attach a `U=1' virtual placement that
+  subsequent placeholder cells reference."
+  (let* ((mode (kitty-gfx--effective-placement-mode))
+         (chunk-size kitty-gfx-chunk-size)
          (len (length base64-data))
          (offset 0)
          (first t)
          (chunk-count 0))
-    (kitty-gfx--log "transmit-begin: id=%d b64-len=%d chunk-size=%d chunks=%d"
-                     id len chunk-size (ceiling (/ (float len) chunk-size)))
+    (kitty-gfx--log "transmit-begin: id=%d b64-len=%d chunk-size=%d chunks=%d mode=%s"
+                     id len chunk-size (ceiling (/ (float len) chunk-size)) mode)
     (while (< offset len)
       (let* ((end (min (+ offset chunk-size) len))
              (chunk (substring base64-data offset end))
@@ -508,7 +696,25 @@ with `kitty-gfx--place-image'."
         (cl-incf chunk-count)
         (setq offset end
               first nil)))
-    (kitty-gfx--log "transmit-done: id=%d chunks-sent=%d" id chunk-count)))
+    (kitty-gfx--log "transmit-done: id=%d chunks-sent=%d" id chunk-count)
+    (when (eq mode 'placeholder)
+      (kitty-gfx--register-virtual-placement id))))
+
+(defun kitty-gfx--register-virtual-placement (id)
+  "Register a virtual placement (`a=p,U=1') for image ID.
+This is the placement-step counterpart to a plain `a=t' transmit
+when operating in `placeholder' mode.  The placement has no screen
+coordinates; instead, any subsequent cell containing the Unicode
+placeholder character with a foreground color encoding ID renders
+the corresponding fragment of the stored image.
+
+We deliberately split this from `a=T,U=1' (transmit-and-display)
+because the combined form causes some terminals (e.g. Ghostty
+1.3.x) to also draw one copy of the image at the cursor position
+at transmit time, producing an unwanted ghost copy."
+  (kitty-gfx--log "register-virtual-placement: id=%d" id)
+  (kitty-gfx--terminal-send
+   (format "\e_Ga=p,U=1,i=%d,q=2\e\\" id)))
 
 (defun kitty-gfx--delete-by-id (id)
   "Delete image with ID and free data."
@@ -562,14 +768,24 @@ env otherwise."
 (defun kitty-gfx--kitty-detect ()
   "Return non-nil if the terminal supports Kitty graphics protocol.
 Reads env vars via `kitty-gfx--frame-getenv' so emacs --daemon
-clients see the attached terminal's environment."
+clients see the attached terminal's environment.
+
+Inside tmux `TERM_PROGRAM' is masked to \"tmux\", so we also accept
+terminal-specific env markers (e.g. `GHOSTTY_RESOURCES_DIR') as
+evidence that the outer terminal speaks the Kitty protocol."
   (let* ((frame (selected-frame))
          (kitty-pid (kitty-gfx--frame-getenv "KITTY_PID" frame))
          (term-prog (kitty-gfx--frame-getenv "TERM_PROGRAM" frame))
+         (ghostty (or (kitty-gfx--frame-getenv "GHOSTTY_RESOURCES_DIR" frame)
+                      (kitty-gfx--frame-getenv "GHOSTTY_BIN_DIR" frame)))
+         (wezterm (kitty-gfx--frame-getenv "WEZTERM_EXECUTABLE" frame))
          (supported (or kitty-pid
+                        ghostty
+                        wezterm
                         (member term-prog '("kitty" "WezTerm" "ghostty")))))
-    (kitty-gfx--log "kitty-detect: %s (KITTY_PID=%s TERM_PROGRAM=%s)"
-                     supported kitty-pid term-prog)
+    (kitty-gfx--log "kitty-detect: %s (KITTY_PID=%s TERM_PROGRAM=%s GHOSTTY=%s WEZTERM=%s)"
+                     supported kitty-pid term-prog
+                     (if ghostty "set" "no") (if wezterm "set" "no"))
     supported))
 
 (defun kitty-gfx--kitty-prepare (file image-id)
@@ -591,14 +807,81 @@ Returns IMAGE-ID on success, nil on failure."
       (when temp-p
         (ignore-errors (delete-file png))))))
 
-(defun kitty-gfx--kitty-place (_ov image-id placement-id cols rows term-row term-col)
-  "Place Kitty image at terminal position.
-OV is the overlay (unused by Kitty backend but part of the interface)."
-  (kitty-gfx--place-image image-id placement-id cols rows term-row term-col))
+(defun kitty-gfx--kitty-place (ov image-id placement-id cols rows term-row term-col)
+  "Place Kitty image at (TERM-ROW, TERM-COL) using the active placement mode.
+Dispatches to either `kitty-gfx--place-placeholder' (when
+`kitty-gfx-kitty-placement-mode' resolves to `placeholder') or the
+existing direct-placement `kitty-gfx--place-image' otherwise.
 
-(defun kitty-gfx--kitty-delete (_ov image-id placement-id)
-  "Delete Kitty placement PID of image ID."
-  (kitty-gfx--delete-placement image-id placement-id))
+PLACEMENT-ID is window-specific (allocated per (overlay, window) by
+`kitty-gfx--record-image-placement') and is reused by the
+placeholder path as the per-window key for tracking previously-
+emitted areas, so the same overlay shown in two windows does not
+have its second window's cells erased by the first window's
+re-placement."
+  (pcase (kitty-gfx--effective-placement-mode)
+    ('placeholder
+     (kitty-gfx--place-placeholder ov placement-id image-id cols rows
+                                   term-row term-col))
+    (_
+     (kitty-gfx--place-image image-id placement-id cols rows term-row term-col))))
+
+(defun kitty-gfx--place-placeholder (ov pid image-id cols rows term-row term-col)
+  "Render IMAGE-ID at (TERM-ROW, TERM-COL) via Unicode placeholder cells.
+Per-window tracking is keyed by PID — the placement id allocated to
+the (overlay, window) pair by the caller.  Before emitting at the
+new position, erase the area this PID previously occupied (if any)
+so the image does not ghost where it used to be.  After emission,
+remember the new area for the next erase."
+  (when (overlayp ov)
+    (kitty-gfx--erase-placeholder-area ov pid))
+  (kitty-gfx--emit-placeholder-cells image-id cols rows term-row term-col)
+  (when (overlayp ov)
+    (kitty-gfx--record-placeholder-area ov pid term-row term-col cols rows)))
+
+(defun kitty-gfx--record-placeholder-area (ov pid row col cols rows)
+  "Remember on OV that PID was emitted at (ROW, COL) sized COLS x ROWS.
+Replaces any prior entry for PID in OV's `kitty-gfx-placeholder-areas'
+alist."
+  (let* ((areas (overlay-get ov 'kitty-gfx-placeholder-areas))
+         (rest (assq-delete-all pid (copy-sequence areas))))
+    (overlay-put ov 'kitty-gfx-placeholder-areas
+                 (cons (cons pid (list row col cols rows)) rest))))
+
+(defun kitty-gfx--erase-placeholder-area (ov pid)
+  "Overwrite OV's PID-keyed placeholder cells with spaces.
+Reads the saved (row col cols rows) tuple from OV's
+`kitty-gfx-placeholder-areas' alist for PID and writes a rectangle
+of spaces over those terminal cells, so the multiplexer no longer
+holds placeholder bytes the outer terminal would expand back into
+the image.  No-op when no prior area is recorded for PID.  Removes
+PID's entry from the alist after erasing."
+  (when-let* ((areas (overlay-get ov 'kitty-gfx-placeholder-areas))
+              (entry (assq pid areas)))
+    (pcase-let ((`(,row ,col ,cs ,rs) (cdr entry)))
+      (kitty-gfx--log "erase-placeholder-area: pid=%d row=%d col=%d %dx%d"
+                       pid row col cs rs)
+      (let ((parts (list "\e7"))
+            (blank (make-string cs ?\s)))
+        (dotimes (y rs)
+          (push (format "\e[%d;%dH%s" (+ row y) col blank) parts))
+        (push "\e8" parts)
+        (kitty-gfx--terminal-send (mapconcat #'identity (nreverse parts) ""))))
+    (overlay-put ov 'kitty-gfx-placeholder-areas
+                 (assq-delete-all pid (copy-sequence areas)))))
+
+(defun kitty-gfx--kitty-delete (ov image-id placement-id)
+  "Delete Kitty placement PLACEMENT-ID of IMAGE-ID for overlay OV.
+In `direct' mode emit a per-placement delete APC.  In `placeholder'
+mode overwrite OV's PID-keyed placeholder cells with spaces; the
+stored image data is preserved either way so a subsequent re-place
+is cheap."
+  (pcase (kitty-gfx--effective-placement-mode)
+    ('placeholder
+     (when (overlayp ov)
+       (kitty-gfx--erase-placeholder-area ov placement-id)))
+    (_
+     (kitty-gfx--delete-placement image-id placement-id))))
 
 (defun kitty-gfx--kitty-cleanup (_file image-id)
   "Cleanup Kitty image data for FILE (identified by IMAGE-ID)."
@@ -1594,10 +1877,15 @@ refresh based on overlay type."
       (if (and pos
                ;; Start row is on screen
                (<= (car pos) win-bottom)
-               ;; Image must fit: start + rows must not exceed win-bottom.
-               ;; This prevents placing images that overflow the terminal
-               ;; and cause visual corruption.
-               (<= (+ (car pos) rows -1) win-bottom))
+               ;; In `direct' mode the entire image must fit, since
+               ;; `a=p,c,r' places an image at an absolute screen
+               ;; position and some terminals corrupt or scroll when
+               ;; that region overflows the window.  In `placeholder'
+               ;; mode the cells are normal text that Emacs naturally
+               ;; clips to the visible buffer area, so partial
+               ;; visibility is fine.
+               (or (eq (kitty-gfx--effective-placement-mode) 'placeholder)
+                   (<= (+ (car pos) rows -1) win-bottom)))
           ;; Visible and fits — place if position changed
           (let ((new-row (car pos))
                 (new-col (cdr pos)))
@@ -1941,14 +2229,24 @@ underline/color from bleeding through the overlay."
 (defun kitty-gfx--make-overlay (beg end image-id cols rows file &optional reuse-pid)
   "Create overlay from BEG to END for image IMAGE-ID (COLS x ROWS).
 FILE is the source file path (needed by some backends for re-encoding).
-The overlay's display property shows blank space that the terminal
-fills with the image via direct placement.
+
+The overlay's `display' property contains either:
+- blank cells (direct placement mode): the terminal paints the image
+  on top of them via `a=p,c,r' APC.
+- Unicode placeholder cells (placeholder mode): the terminal renders
+  the image at exactly the cells whose contents match the placeholder
+  + diacritic + image-id-as-fg-color pattern.  No further APC needed.
+
 When REUSE-PID is non-nil, reuse that placement ID instead of
 allocating a new one.  This lets the terminal atomically replace
 the old placement (same PID, new dimensions/position) without a
 delete step, avoiding visual glitches in some terminals."
   (let ((ov (make-overlay beg end nil t nil))
         (pid (or reuse-pid (kitty-gfx--alloc-placement-id))))
+    ;; Always reserve screen space with blank cells.  For placeholder
+    ;; mode the actual U+10EEEE + diacritic cells get painted on top
+    ;; by `kitty-gfx--emit-placeholder-cells' during refresh (Emacs's
+    ;; display engine cannot emit those combining marks itself).
     (overlay-put ov 'display
                  (concat (kitty-gfx--make-blank-display cols rows) "\n"))
     (overlay-put ov 'face 'default)  ; override inherited faces (org-link underline etc.)
