@@ -83,6 +83,35 @@ test-latex:
         --eval "(kitty-graphics-mode 1)" \
         tests/test-kitty-gfx.org
 
+# Test inline mpv video playback (Kitty terminal only, requires mpv).
+# Opens terminal Emacs with video integration enabled, then auto-plays
+# the file given as positional arg (or drops into scratch buffer when
+# omitted, ready for `M-x kitty-gfx-play-video').
+#   just test-mpv                       # manual: M-x kitty-gfx-play-video
+#   just test-mpv ~/Untitled.mp4        # auto-play (tilde expanded)
+test-mpv video="":
+    #!/usr/bin/env bash
+    set -eu
+    echo ">> Requires Kitty terminal + mpv on PATH."
+    echo ">> Stop: M-x kitty-gfx-stop-video     Pause: M-x kitty-gfx-toggle-video"
+    video={{video}}
+    # Tolerate `just test-mpv video=PATH' (just treats it as a positional
+    # value that happens to start with `video=', so strip the prefix).
+    video=${video#video=}
+    # Expand ~ and resolve relative paths so Emacs gets an absolute path.
+    if [ -n "$video" ]; then
+        video=$(eval echo "$video")
+        if [ ! -f "$video" ]; then
+            echo "ERROR: file not found: $video" >&2
+            exit 1
+        fi
+        video=$(realpath "$video")
+    fi
+    exec env TERM={{TERM_}} {{EMACS}} -nw -Q -l {{SRC}} \
+        --eval "(setq kitty-gfx-debug t kitty-gfx-enable-video t)" \
+        --eval "(kitty-graphics-mode 1)" \
+        --eval "(when (> (length \"$video\") 0) (kitty-gfx-play-video \"$video\"))"
+
 # --- Headless typst checks --------------------------------------------------
 
 # Compile a typst fragment headlessly, print the PNG path

@@ -3683,7 +3683,15 @@ Falls back to ORIG-FN in GUI."
 COMMAND is encoded as {\"command\": COMMAND}."
   (when (and kitty-gfx--mpv-ipc-connection
              (process-live-p kitty-gfx--mpv-ipc-connection))
-    (let ((json (concat (json-encode `(("command" . ,command))) "\n")))
+    ;; `json' is not autoloaded; require here so callers don't have to.
+    ;; Use the built-in `json-serialize' (Emacs 27+, C-coded) when
+    ;; available -- it's faster and needs no library load.
+    (let ((json (concat
+                 (if (fboundp 'json-serialize)
+                     (json-serialize `(:command ,(vconcat command)))
+                   (require 'json)
+                   (json-encode `(("command" . ,command))))
+                 "\n")))
       (condition-case err
           (process-send-string kitty-gfx--mpv-ipc-connection json)
         (error
@@ -3748,13 +3756,14 @@ ROW and COL are 1-based terminal cell coordinates."
            (win (get-buffer-window (overlay-buffer ov))))
       (when (and win
                  (pos-visible-in-window-p start win))
-        (let* ((win-edges (window-edges win nil nil t))
+        ;; In terminal Emacs, `window-edges' already returns character
+        ;; cell coordinates; the pixelwise flag is a no-op on TTY frames.
+        (let* ((win-edges (window-edges win nil nil nil))
                (win-top (nth 1 win-edges))
                (win-left (nth 0 win-edges))
                (coords (posn-col-row (posn-at-point start win)))
                (col (+ win-left (car coords) 1))
-               (row (+ (/ win-top (or kitty-gfx--cell-pixel-height 16))
-                       (cdr coords) 1)))
+               (row (+ win-top (cdr coords) 1)))
           (cons row col))))))
 
 (defun kitty-gfx--refresh-mpv-overlay ()
@@ -3805,7 +3814,12 @@ PROC is the mpv process, EVENT describes the state change."
     (ignore-errors (delete-overlay kitty-gfx--mpv-overlay))
     (setq kitty-gfx--mpv-overlay nil))
   (setq kitty-gfx--mpv-last-row nil
-        kitty-gfx--mpv-last-col nil))
+        kitty-gfx--mpv-last-col nil)
+  ;; mpv's kitty VO may hide the cursor; restore it.  Also force a full
+  ;; redisplay so Emacs repaints the region mpv was occupying.
+  (ignore-errors (send-string-to-terminal "\e[?25h"))
+  (force-mode-line-update t)
+  (when (fboundp 'redraw-display) (redraw-display)))
 
 ;;;###autoload
 (defun kitty-gfx-play-video (file)
@@ -3849,27 +3863,59 @@ Requires `kitty-gfx-enable-video' to be non-nil and mpv installed."
         (setq row (car pos) col (cdr pos))))
     ;; Store socket path
     (setq kitty-gfx--mpv-ipc-socket socket-path)
-    ;; Spawn mpv
-    (let ((proc (start-process
-                 "kitty-gfx-mpv" nil "mpv"
-                 "--vo=kitty"
-                 "--vo-kitty-use-shm=yes"
-                 (format "--vo-kitty-left=%d" col)
-                 (format "--vo-kitty-top=%d" row)
-                 (format "--vo-kitty-width=%d" width-px)
-                 (format "--vo-kitty-height=%d" height-px)
-                 "--vo-kitty-config-clear=no"
-                 "--vo-kitty-alt-screen=no"
-                 "--really-quiet"
-                 "--no-terminal"
-                 (format "--input-ipc-server=%s" socket-path)
-                 file)))
+    ;; Spawn mpv on a pty so its kitty VO escape stream can be captured.
+    ;; mpv writes APC graphics sequences to stdout; we forward each chunk
+    ;; to the Emacs controlling terminal via `send-string-to-terminal'.
+    (let* ((process-connection-type t) ; pty so mpv sees a tty for VO
+           (proc (make-process
+                  :name "kitty-gfx-mpv"
+                  :buffer nil
+                  :noquery t
+                  :connection-type 'pty
+                  :coding '(binary . binary)
+                  :command
+                  (list "mpv"
+                        ;; Ignore user's mpv.conf and scripts: keeps
+                        ;; embed playback predictable and avoids loading
+                        ;; heavy scripts (thumbfast etc.) that spike CPU.
+                        "--no-config"
+                        ;; Hardware-decode to keep CPU down.
+                        "--hwdec=auto-safe"
+                        "--vo=kitty"
+                        ;; Send frames via shared memory rather than
+                        ;; base64 inside APC escapes -- orders of
+                        ;; magnitude less data through the pty filter.
+                        "--vo-kitty-use-shm=yes"
+                        (format "--vo-kitty-cols=%d" video-cols)
+                        (format "--vo-kitty-rows=%d" video-rows)
+                        (format "--vo-kitty-width=%d" width-px)
+                        (format "--vo-kitty-height=%d" height-px)
+                        (format "--vo-kitty-left=%d" col)
+                        (format "--vo-kitty-top=%d" row)
+                        "--vo-kitty-config-clear=no"
+                        "--vo-kitty-alt-screen=no"
+                        "--really-quiet"
+                        "--no-input-terminal"
+                        (format "--input-ipc-server=%s" socket-path)
+                        file)
+                  :filter #'kitty-gfx--mpv-filter
+                  :sentinel #'kitty-gfx--mpv-process-sentinel)))
       (setq kitty-gfx--mpv-process proc)
-      (set-process-sentinel proc #'kitty-gfx--mpv-process-sentinel)
-      (set-process-query-on-exit-flag proc nil)
       (kitty-gfx--log "mpv: started pid=%s file=%s" (process-id proc) file)
       ;; Connect IPC after mpv creates the socket
       (kitty-gfx--mpv-ipc-connect socket-path nil))))
+
+(defun kitty-gfx--mpv-filter (_proc chunk)
+  "Forward mpv stdout CHUNK to the Emacs controlling terminal.
+mpv with `--vo=kitty' emits APC graphics escapes to its stdout.
+When spawned as a subprocess of Emacs, those bytes land here.
+Writing them straight back out with `send-string-to-terminal'
+makes the terminal paint the frames inline."
+  (when (and chunk (> (length chunk) 0))
+    (condition-case err
+        (send-string-to-terminal chunk)
+      (error
+       (kitty-gfx--log "mpv-filter error: %s" (error-message-string err))))))
 
 (defun kitty-gfx-stop-video ()
   "Stop the current buffer's inline video playback."
