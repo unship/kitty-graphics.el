@@ -1960,9 +1960,41 @@ refresh based on overlay type."
               ;; explicitly erase it first.  `sixel-delete' reads OLD
               ;; last-row/last-col/cols/rows from the overlay, so erase
               ;; BEFORE updating the cache below (issue #13).
-              (when (and last-row
-                         (eq kitty-gfx--active-backend 'sixel))
-                (funcall (kitty-gfx--backend-fn 'delete) ov id pid))
+              ;;
+              ;; Kitty direct mode: same-PID re-placement is supposed to
+              ;; atomically replace the old placement, but when the new
+              ;; geometry is smaller than the old one, several terminals
+              ;; (Ghostty, WezTerm) leave the cells outside the new
+              ;; rectangle painted with the old image's pixels.  Detect
+              ;; the shrink case from the per-window placement's recorded
+              ;; :cols/:rows and emit an explicit delete first so the old
+              ;; rectangle is fully cleared before the new placement
+              ;; appears.  Placeholder mode already erases inside
+              ;; `kitty-gfx--place-placeholder', so it is not covered here.
+              (when last-row
+                (let* ((old-cols (plist-get placement-data :cols))
+                       (old-rows (plist-get placement-data :rows))
+                       (shrunk (or (and old-cols (< cols old-cols))
+                                   (and old-rows (< rows old-rows)))))
+                  (cond
+                   ((eq kitty-gfx--active-backend 'sixel)
+                    (funcall (kitty-gfx--backend-fn 'delete) ov id pid))
+                   ((and (eq kitty-gfx--active-backend 'kitty)
+                         (eq (kitty-gfx--effective-placement-mode) 'direct)
+                         shrunk)
+                    ;; The terminal placement was emitted with the
+                    ;; per-window PID recorded on the overlay's
+                    ;; placement, NOT the overlay-level PID, so the
+                    ;; delete APC must address that PID.  Fall back to
+                    ;; the overlay-level PID only when no per-window
+                    ;; entry exists.
+                    (let ((win-pid (or (plist-get placement-data :pid)
+                                       pid)))
+                      (kitty-gfx--log
+                       "refresh-ov: pid=%d (win-pid=%d) shrink %dx%d -> %dx%d, delete first"
+                       pid win-pid old-cols old-rows cols rows)
+                      (funcall (kitty-gfx--backend-fn 'delete)
+                               ov id win-pid))))))
               (overlay-put ov 'kitty-gfx-last-row new-row)
               (overlay-put ov 'kitty-gfx-last-col new-col)
               (kitty-gfx--record-image-placement ov win new-row new-col cols rows pid)
