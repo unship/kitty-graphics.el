@@ -2863,28 +2863,46 @@ but only the first frame is rendered (no animation in terminal)."
                      '("png" "jpg" "jpeg" "bmp" "svg"
                        "webp" "tiff" "tif" "gif")))))
 
+(defun kitty-gfx--video-extension-p (file)
+  "Return non-nil if FILE has a registered video extension.
+Checks only the extension; see `kitty-gfx--mpv-available-p' for
+whether playback is actually wired up."
+  (let ((ext (file-name-extension file)))
+    (and ext (member (downcase ext) kitty-gfx-video-file-extensions))))
+
 (defun kitty-gfx--video-file-p (file)
   "Return non-nil if FILE is a video that the mpv preview can handle.
 Requires `kitty-gfx-enable-video' to be enabled, mpv on PATH, and
 the Kitty backend active -- the same gates as
 `kitty-gfx--mpv-available-p'."
   (and (kitty-gfx--mpv-available-p)
-       (let ((ext (file-name-extension file)))
-         (and ext (member (downcase ext)
-                          kitty-gfx-video-file-extensions)))))
+       (kitty-gfx--video-extension-p file)))
 
 (defvar kitty-gfx--video-thumbnail-cache-dir
   (expand-file-name "kitty-gfx-thumbs/" temporary-file-directory)
   "Directory holding cached video thumbnail PNGs.")
+
+(defvar kitty-gfx--ffmpeg-warned nil
+  "Non-nil once we have echoed a missing-ffmpeg warning in this session.
+Prevents flooding the echo area when dirvish previews many videos
+in a row without ffmpeg installed.")
 
 (defun kitty-gfx--video-thumbnail (file)
   "Return a PNG thumbnail path for video FILE.
 Extracts the frame at `kitty-gfx-video-thumbnail-seek' via ffmpeg
 and caches it under `kitty-gfx--video-thumbnail-cache-dir', keyed
 by file path + mtime so an edited video gets a fresh thumbnail.
-Returns nil if ffmpeg is missing or extraction fails."
+Returns nil if ffmpeg is missing or extraction fails.  Echoes a
+one-shot warning on the first call when ffmpeg is missing so the
+user knows why their videos have no thumbnails."
   (let ((ffmpeg (executable-find "ffmpeg")))
-    (when ffmpeg
+    (cond
+     ((not ffmpeg)
+      (unless kitty-gfx--ffmpeg-warned
+        (setq kitty-gfx--ffmpeg-warned t)
+        (message "kitty-gfx: ffmpeg not on PATH; video thumbnails disabled"))
+      nil)
+     (t
       (unless (file-directory-p kitty-gfx--video-thumbnail-cache-dir)
         (make-directory kitty-gfx--video-thumbnail-cache-dir t))
       (let* ((file (expand-file-name file))
@@ -2906,7 +2924,7 @@ Returns nil if ffmpeg is missing or extraction fails."
                          out)))
               (kitty-gfx--log "video-thumbnail: exit=%s file=%s out=%s"
                               exit file out)
-              (when (and (eq exit 0) (file-exists-p out)) out))))))))
+              (when (and (eq exit 0) (file-exists-p out)) out)))))))))
 
 (defun kitty-gfx--org-display-inline-images-tty (&optional _include-linked beg end)
   "Display inline images in org buffer via Kitty graphics.
@@ -3786,8 +3804,10 @@ heavier shortcut for full playback."
   (unless (derived-mode-p 'dired-mode)
     (user-error "Not in a dired buffer"))
   (let ((file (dired-get-file-for-visit)))
-    (unless (kitty-gfx--video-file-p file)
+    (unless (kitty-gfx--video-extension-p file)
       (user-error "Not a video file"))
+    (when-let* ((reason (kitty-gfx--mpv-unavailable-reason)))
+      (user-error "kitty-gfx: cannot play video: %s" reason))
     ;; Single-video invariant: kill any other live playback first.
     (let ((existing (kitty-gfx--mpv-buffer)))
       (when existing (with-current-buffer existing (kitty-gfx--mpv-cleanup))))
@@ -3800,22 +3820,43 @@ heavier shortcut for full playback."
             (goto-char (point-max))
             (kitty-gfx-play-video file)))))))
 
+(defvar kitty-gfx--mpv-warn-throttle 0
+  "Float-time of the last \"mpv unavailable\" message.
+Used to throttle repeat warnings to at most once every few
+seconds, so navigating across multiple video files in dired or
+dirvish does not flood the echo area.")
+
+(defun kitty-gfx--warn-mpv-unavailable (reason)
+  "Echo REASON for mpv unavailability, throttled to once per ~3s."
+  (let ((now (float-time)))
+    (when (> (- now kitty-gfx--mpv-warn-throttle) 3.0)
+      (setq kitty-gfx--mpv-warn-throttle now)
+      (message "kitty-gfx: inline video preview disabled (%s)" reason))))
+
 (defun kitty-gfx--dired-find-file-advice (orig-fn &rest args)
   "Around advice on `dired-find-file' that routes videos to mpv.
 Avoids Emacs's \"file too big\" prompt for multi-MB videos by
 delegating to `kitty-gfx-dired-play-video' when the file at point
-matches `kitty-gfx--video-file-p'.  Non-video files pass through.
+has a video extension and mpv is available.  Non-video files pass
+through.
+
+When the file has a video extension but mpv playback is
+unavailable (no mpv binary, kitty backend off, etc.), echo a
+one-shot warning explaining why and fall through to ORIG-FN.
 
 Inside an active dirvish session, pass through to ORIG-FN so
 `kitty-gfx--dirvish-find-entry-hook' can play the video in the
-existing preview window.  Going through
-`display-buffer-in-side-window' there would cause dirvish to
-rebuild its layout (transient `delete-other-windows'), which the
-user sees as the preview buffer briefly going full-frame before
-mpv starts."
+appropriate window.  Going through `display-buffer-in-side-window'
+there would cause dirvish to rebuild its layout (transient
+`delete-other-windows'), which the user sees as the preview
+buffer briefly going full-frame before mpv starts."
   (let ((file (ignore-errors (dired-get-file-for-visit))))
     (cond
-     ((not (and file (kitty-gfx--video-file-p file)))
+     ((not (and file (kitty-gfx--video-extension-p file)))
+      (apply orig-fn args))
+     ((kitty-gfx--mpv-unavailable-reason)
+      (kitty-gfx--warn-mpv-unavailable
+       (kitty-gfx--mpv-unavailable-reason))
       (apply orig-fn args))
      ((and (featurep 'dirvish)
            (fboundp 'dirvish-curr)
@@ -3827,7 +3868,11 @@ mpv starts."
   "Around advice on `dired-find-file-other-window' that routes videos to mpv."
   (let ((file (ignore-errors (dired-get-file-for-visit))))
     (cond
-     ((not (and file (kitty-gfx--video-file-p file)))
+     ((not (and file (kitty-gfx--video-extension-p file)))
+      (apply orig-fn args))
+     ((kitty-gfx--mpv-unavailable-reason)
+      (kitty-gfx--warn-mpv-unavailable
+       (kitty-gfx--mpv-unavailable-reason))
       (apply orig-fn args))
      ((and (featurep 'dirvish)
            (fboundp 'dirvish-curr)
@@ -3848,7 +3893,14 @@ to non-nil to instead keep the layout and play ENTRY inside the
 existing dirvish preview side window."
   (when (and (memq find-fn '(find-file find-alternate-file))
              (stringp entry)
-             (kitty-gfx--video-file-p entry))
+             (kitty-gfx--video-extension-p entry)
+             ;; mpv unreachable: warn and yield to dirvish's normal
+             ;; find-fn (returns nil from the hook).  We've still
+             ;; told the user why we didn't preview.
+             (let ((reason (kitty-gfx--mpv-unavailable-reason)))
+               (if reason
+                   (progn (kitty-gfx--warn-mpv-unavailable reason) nil)
+                 t)))
     (let* ((dv (ignore-errors (dirvish-curr)))
            (pwin (and dv (ignore-errors (dv-preview-window dv))))
            (basename (file-name-nondirectory entry))
@@ -4040,6 +4092,21 @@ Falls back to ORIG-FN in GUI."
        (not (display-graphic-p))
        (eq kitty-gfx--active-backend 'kitty)
        (executable-find "mpv")))
+
+(defun kitty-gfx--mpv-unavailable-reason ()
+  "Return a user-facing string explaining why mpv playback is unavailable.
+Returns nil when mpv playback is available."
+  (cond
+   ((not kitty-gfx-enable-video)
+    "kitty-gfx-enable-video is nil (set it to t to enable mpv)")
+   ((not kitty-graphics-mode)
+    "kitty-graphics-mode is disabled")
+   ((display-graphic-p)
+    "running in GUI Emacs (inline mpv is a terminal feature)")
+   ((not (eq kitty-gfx--active-backend 'kitty))
+    "Kitty backend not active")
+   ((not (executable-find "mpv"))
+    "mpv executable not found on PATH")))
 
 (defun kitty-gfx--mpv-ipc-send (command)
   "Send COMMAND (a list) to mpv via JSON IPC.
