@@ -573,6 +573,9 @@ across window hide/show.")
 (defvar-local kitty-gfx--browser-image-id nil
   "Kitty image id allocated for this buffer's casty frames.")
 
+(defvar-local kitty-gfx--browser-image-id-b nil
+  "Second kitty image id for casty's flicker-free double buffering.")
+
 (defvar-local kitty-gfx--browser-cols nil
   "Current browser frame width in columns.")
 
@@ -4785,10 +4788,13 @@ Safe to call more than once."
   (when kitty-gfx--browser-ipc-socket
     (ignore-errors (delete-file kitty-gfx--browser-ipc-socket))
     (setq kitty-gfx--browser-ipc-socket nil))
-  ;; Free the kitty image casty was drawing into.
+  ;; Free both kitty images casty was double-buffering into.
   (when kitty-gfx--browser-image-id
     (ignore-errors (kitty-gfx--delete-by-id kitty-gfx--browser-image-id))
     (setq kitty-gfx--browser-image-id nil))
+  (when kitty-gfx--browser-image-id-b
+    (ignore-errors (kitty-gfx--delete-by-id kitty-gfx--browser-image-id-b))
+    (setq kitty-gfx--browser-image-id-b nil))
   (when kitty-gfx--browser-overlay
     (ignore-errors (delete-overlay kitty-gfx--browser-overlay))
     (setq kitty-gfx--browser-overlay nil))
@@ -4820,12 +4826,14 @@ Requires `kitty-gfx-enable-browser' to be non-nil and casty installed."
            (width-px (nth 2 geom))
            (height-px (nth 3 geom))
            (id (kitty-gfx--alloc-id))
+           (id-b (kitty-gfx--alloc-id))
            (socket (concat (make-temp-name "/tmp/kitty-gfx-casty-") ".sock"))
            (inhibit-read-only t))
       (erase-buffer)
       (insert (make-string rows ?\n))
       (goto-char (point-min))
       (setq kitty-gfx--browser-image-id id
+            kitty-gfx--browser-image-id-b id-b
             kitty-gfx--browser-ipc-socket socket
             kitty-gfx--browser-cols cols
             kitty-gfx--browser-rows rows)
@@ -4868,6 +4876,7 @@ Requires `kitty-gfx-enable-browser' to be non-nil and casty installed."
                     (list kitty-gfx-casty-program "--embed"
                           "--ipc" socket
                           "--image-id" (number-to-string id)
+                          "--image-id-b" (number-to-string id-b)
                           "--cols" (number-to-string cols)
                           "--rows" (number-to-string rows)
                           "--top" (number-to-string row)
