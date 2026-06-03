@@ -4056,10 +4056,15 @@ Registers `kitty-image' dispatcher and prepends it to the dispatcher list."
     ;; branches on file type.
     (defalias 'dirvish-kitty-image-dp
       (lambda (file ext preview-window dv)
-        (when (or (and (boundp 'dirvish-image-exts)
-                       (member ext dirvish-image-exts))
-                  (member (and ext (downcase ext))
-                          kitty-gfx-video-file-extensions))
+        ;; Use kitty-gfx's own extension predicates so the match is
+        ;; case-insensitive (PNG, JPG, …) and consistent with the
+        ;; branching inside `kitty-gfx--dirvish-preview'.  Earlier the
+        ;; image arm relied on bare `member ext dirvish-image-exts'
+        ;; which is case-sensitive and missed uppercase extensions —
+        ;; the file then fell through to `dirvish-image-dp' and
+        ;; crashed with "Window system frame should be used" on TTY.
+        (when (or (kitty-gfx--image-file-p file)
+                  (kitty-gfx--video-extension-p file))
           (kitty-gfx--dirvish-preview file ext preview-window dv))))
     ;; Prepend kitty-image to dispatchers if not already there
     (unless (memq 'kitty-image dirvish-preview-dispatchers)
