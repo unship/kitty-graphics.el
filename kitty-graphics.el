@@ -349,8 +349,13 @@ placement leaks images across pane switches) and `direct' outside
     ('placeholder 'placeholder)
     (_ (if (kitty-gfx--frame-getenv "TMUX") 'placeholder 'direct))))
 
-(defun kitty-gfx--emit-placeholder-cells (image-id cols rows term-row term-col)
+(defun kitty-gfx--emit-placeholder-cells (image-id cols rows term-row term-col
+                                                   &optional src-row)
   "Emit a COLS x ROWS block of Kitty Unicode placeholder cells.
+
+SRC-ROW (default 0) is the first image cell row to emit: the block
+covers image rows SRC-ROW .. SRC-ROW+ROWS-1, which lets the caller
+draw only the visible band of a partially scrolled image.
 
 Bytes are written via `kitty-gfx--terminal-send' rather than going
 through Emacs's display engine: Emacs strips combining diacritics
@@ -369,29 +374,30 @@ TERM-ROW and TERM-COL are 1-based terminal coordinates of the
 image area's top-left.  The emission is bracketed by DECSC/DECRC
 \(`\\e7' / `\\e8') so the caller's cursor and SGR state are
 preserved."
-  (let ((max (length kitty-gfx--diacritics)))
+  (let ((max (length kitty-gfx--diacritics))
+        (src (or src-row 0)))
     (cond
      ((> image-id #xffffff)
       (error "kitty-gfx: image id %d exceeds 24 bits — \
 placeholder mode cannot encode it" image-id))
-     ((or (> rows max) (> cols max))
-      (error "kitty-gfx: image %dx%d cells exceeds the %d-entry placeholder grid"
-             cols rows max))))
-  (let* ((sgr (format "\e[38;2;%d;%d;%dm"
-                      (logand (ash image-id -16) #xff)
-                      (logand (ash image-id -8)  #xff)
-                      (logand image-id           #xff)))
-         (ph (string kitty-gfx--placeholder-char))
-         (parts (list "\e7" sgr)))
-    (dotimes (y rows)
-      (push (format "\e[%d;%dH" (+ term-row y) term-col) parts)
-      (let ((row-dia (string (aref kitty-gfx--diacritics y))))
-        (dotimes (x cols)
-          (push ph parts)
-          (push row-dia parts)
-          (push (string (aref kitty-gfx--diacritics x)) parts))))
-    (push "\e[0m\e8" parts)
-    (kitty-gfx--terminal-send (mapconcat #'identity (nreverse parts) ""))))
+     ((or (> (+ src rows) max) (> cols max))
+      (error "kitty-gfx: image %dx%d cells (from row %d) exceeds the %d-entry placeholder grid"
+             cols rows src max)))
+    (let* ((sgr (format "\e[38;2;%d;%d;%dm"
+                        (logand (ash image-id -16) #xff)
+                        (logand (ash image-id -8)  #xff)
+                        (logand image-id           #xff)))
+           (ph (string kitty-gfx--placeholder-char))
+           (parts (list "\e7" sgr)))
+      (dotimes (y rows)
+        (push (format "\e[%d;%dH" (+ term-row y) term-col) parts)
+        (let ((row-dia (string (aref kitty-gfx--diacritics (+ src y)))))
+          (dotimes (x cols)
+            (push ph parts)
+            (push row-dia parts)
+            (push (string (aref kitty-gfx--diacritics x)) parts))))
+      (push "\e[0m\e8" parts)
+      (kitty-gfx--terminal-send (mapconcat #'identity (nreverse parts) "")))))
 
 ;;;; Internal state
 
@@ -871,17 +877,27 @@ at transmit time, producing an unwanted ghost copy."
     (kitty-gfx--log "alloc-pid: %d" pid)
     pid))
 
-(defun kitty-gfx--place-image (image-id placement-id cols rows term-row term-col)
+(defun kitty-gfx--place-image (image-id placement-id cols rows term-row term-col
+                                        &optional src-y-px src-h-px)
   "Place image IMAGE-ID at terminal position TERM-ROW, TERM-COL.
 PLACEMENT-ID is the unique placement ID (p=PID) — reusing the same PID
 replaces the previous placement, preventing accumulation.
 COLS x ROWS is the size in terminal cells.
-Uses direct placement: move cursor, then `a=p' with `c' and `r' params."
-  (kitty-gfx--log "place: id=%d pid=%d cols=%d rows=%d row=%d col=%d"
-                   image-id placement-id cols rows term-row term-col)
+Uses direct placement: move cursor, then `a=p' with `c' and `r' params.
+
+When SRC-H-PX is non-nil, only the source-pixel band starting at
+SRC-Y-PX and SRC-H-PX pixels tall is displayed (`y'/`h' source
+rectangle params) — used to draw the visible part of a partially
+scrolled image."
+  (kitty-gfx--log "place: id=%d pid=%d cols=%d rows=%d row=%d col=%d%s"
+                   image-id placement-id cols rows term-row term-col
+                   (if src-h-px (format " src-y=%dpx src-h=%dpx" src-y-px src-h-px) ""))
   (kitty-gfx--terminal-send
-   (format "\e7\e[%d;%dH\e_Gq=2,a=p,i=%d,p=%d,c=%d,r=%d\e\\\e8"
-           term-row term-col image-id placement-id cols rows)))
+   (if src-h-px
+       (format "\e7\e[%d;%dH\e_Gq=2,a=p,i=%d,p=%d,c=%d,r=%d,y=%d,h=%d\e\\\e8"
+               term-row term-col image-id placement-id cols rows src-y-px src-h-px)
+     (format "\e7\e[%d;%dH\e_Gq=2,a=p,i=%d,p=%d,c=%d,r=%d\e\\\e8"
+             term-row term-col image-id placement-id cols rows))))
 
 ;;;; Kitty backend
 
@@ -941,7 +957,8 @@ Returns IMAGE-ID on success, nil on failure."
       (when temp-p
         (ignore-errors (delete-file png))))))
 
-(defun kitty-gfx--kitty-place (ov image-id placement-id cols rows term-row term-col)
+(defun kitty-gfx--kitty-place (ov image-id placement-id cols rows term-row term-col
+                                  &optional src-row)
   "Place Kitty image at (TERM-ROW, TERM-COL) using the active placement mode.
 Dispatches to either `kitty-gfx--place-placeholder' (when
 `kitty-gfx-kitty-placement-mode' resolves to `placeholder') or the
@@ -952,16 +969,33 @@ PLACEMENT-ID is window-specific (allocated per (overlay, window) by
 placeholder path as the per-window key for tracking previously-
 emitted areas, so the same overlay shown in two windows does not
 have its second window's cells erased by the first window's
-re-placement."
+re-placement.
+
+SRC-ROW (default 0) selects the first image cell row to show; ROWS
+then counts the rows of the visible band rather than the full image.
+Placeholder mode crops by emitting only those cells; direct mode
+crops via the placement's pixel source rectangle, computed from the
+overlay's `kitty-gfx-px-h' and `kitty-gfx-rows'."
   (pcase (kitty-gfx--effective-placement-mode)
     ('placeholder
      (kitty-gfx--place-placeholder ov placement-id image-id cols rows
-                                   term-row term-col))
+                                   term-row term-col src-row))
     (_
-     (kitty-gfx--place-image image-id placement-id cols rows term-row term-col))))
+     (let* ((src (or src-row 0))
+            (total (or (and (overlayp ov) (overlay-get ov 'kitty-gfx-rows)) rows))
+            (px-h (and (overlayp ov) (overlay-get ov 'kitty-gfx-px-h))))
+       (if (and px-h (> px-h 0) (or (> src 0) (< rows total)))
+           (kitty-gfx--place-image
+            image-id placement-id cols rows term-row term-col
+            (round (/ (* src px-h) (float total)))
+            (max 1 (round (/ (* rows px-h) (float total)))))
+         (kitty-gfx--place-image image-id placement-id cols rows
+                                 term-row term-col))))))
 
-(defun kitty-gfx--place-placeholder (ov pid image-id cols rows term-row term-col)
+(defun kitty-gfx--place-placeholder (ov pid image-id cols rows term-row term-col
+                                        &optional src-row)
   "Render IMAGE-ID at (TERM-ROW, TERM-COL) via Unicode placeholder cells.
+SRC-ROW (default 0) is the first image cell row of the emitted band.
 Per-window tracking is keyed by PID — the placement id allocated to
 the (overlay, window) pair by the caller.  Before emitting at the
 new position, erase the area this PID previously occupied (if any)
@@ -969,7 +1003,7 @@ so the image does not ghost where it used to be.  After emission,
 remember the new area for the next erase."
   (when (overlayp ov)
     (kitty-gfx--erase-placeholder-area ov pid))
-  (kitty-gfx--emit-placeholder-cells image-id cols rows term-row term-col)
+  (kitty-gfx--emit-placeholder-cells image-id cols rows term-row term-col src-row)
   (when (overlayp ov)
     (kitty-gfx--record-placeholder-area ov pid term-row term-col cols rows)))
 
@@ -1247,9 +1281,12 @@ Returns non-nil on success."
       (puthash file png kitty-gfx--sixel-cache)
       t)))
 
-(defun kitty-gfx--sixel-place (ov _image-id _placement-id cols rows term-row term-col)
+(defun kitty-gfx--sixel-place (ov _image-id _placement-id cols rows term-row term-col
+                                  &optional _src-row)
   "Place Sixel image at terminal position.
-Encodes on-demand if not cached, then emits DCS sequence."
+Encodes on-demand if not cached, then emits DCS sequence.
+_SRC-ROW is accepted for dispatch compatibility but ignored — the
+refresh cycle never asks Sixel for a cropped band."
   (let* ((file (overlay-get ov 'kitty-gfx-file))
          (png (gethash file kitty-gfx--sixel-cache))
          (cache-path (kitty-gfx--sixel-cache-path file cols rows))
@@ -1834,11 +1871,41 @@ range, inside a folded region, or not visible on screen."
                             (eq (window-buffer win) buf)
                             win)
                        (get-buffer-window buf)))))
-    ;; Fast path: skip entirely if no window, no position, or
-    ;; buffer position is outside the visible window range.
-    ;; This avoids expensive posn-at-point and fold checks.
-    (when (and win pos
-               (<= (window-start win) pos)
+    (when (and win pos)
+      (kitty-gfx--screen-pos-at pos ov win))))
+
+(defun kitty-gfx--overlay-visible-band (ov win)
+  "Return (TERM-ROW TERM-COL SRC-ROW) for OV's first visible canvas row.
+TERM-ROW/TERM-COL are the 1-based terminal coordinates where image
+cell row SRC-ROW (0-based) should be drawn in WIN; nil when nothing
+of OV is visible.
+
+For a block (unsliced) canvas this degenerates to
+`kitty-gfx--overlay-screen-pos' with SRC-ROW 0: the canvas is one
+display string, so either its start is on screen or nothing is.
+For a sliced canvas (`kitty-gfx-slices') each canvas row has its own
+anchor character, `window-start' can sit mid-image, and the band
+starts at the first slice anchor at or after it — an image whose top
+is scrolled out yields SRC-ROW > 0 instead of nil."
+  (let ((slices (overlay-get ov 'kitty-gfx-slices)))
+    (if (not slices)
+        (when-let* ((pos (kitty-gfx--overlay-screen-pos ov win)))
+          (list (car pos) (cdr pos) 0))
+      (let* ((beg (overlay-start ov))
+             (idx (max 0 (min (- (window-start win) beg)
+                              (1- (length slices))))))
+        (when-let* ((pos (kitty-gfx--screen-pos-at (+ beg idx) ov win)))
+          (list (car pos) (cdr pos) idx))))))
+
+(defun kitty-gfx--screen-pos-at (pos ov win)
+  "Return terminal (ROW . COL) of buffer position POS in WIN, or nil.
+Coordinates are 1-indexed terminal positions.  OV is the overlay being
+measured (used for logging only).  Returns nil when POS is outside
+WIN's visible range, inside a folded region, or not visible."
+    ;; Fast path: skip entirely if position is outside the visible
+    ;; window range.  This avoids expensive posn-at-point and fold
+    ;; checks.
+    (when (and (<= (window-start win) pos)
                (<= pos (window-end win t))
                (pos-visible-in-window-p pos win)
                ;; Check structural folding (outline, org-fold).
@@ -1876,7 +1943,7 @@ range, inside a folded region, or not visible on screen."
                 (kitty-gfx--log "screen-pos: pid=%s pos=%d win=%s -> row=%d col=%d"
                                 (overlay-get ov 'kitty-gfx-pid) pos win
                                 (car result) (cdr result))
-                result))))))))
+                result)))))))
 
 ;;;; Refresh cycle
 
@@ -2022,93 +2089,167 @@ refresh based on overlay type."
       ;; OSC 66 emission happens in phase 2 (kitty-gfx--emit-heading-overlays).
       (kitty-gfx--refresh-heading-overlay ov win win-bottom)
   ;; Image overlay refresh
-  (let* ((pos (kitty-gfx--overlay-screen-pos ov win))
+  (let* ((band (kitty-gfx--overlay-visible-band ov win))
          (rows (overlay-get ov 'kitty-gfx-rows))
          (cols (overlay-get ov 'kitty-gfx-cols))
          (placement (kitty-gfx--image-placement ov win))
          (placement-data (cdr placement))
          (last-row (plist-get placement-data :row))
-         (last-col (plist-get placement-data :col)))
+         (last-col (plist-get placement-data :col))
+         (last-src (plist-get placement-data :src-row))
+         (last-nrows (plist-get placement-data :rows)))
     (let ((pid (overlay-get ov 'kitty-gfx-pid))
           (id (overlay-get ov 'kitty-gfx-id)))
-      (if (and pos
-               ;; Start row is on screen
-               (<= (car pos) win-bottom)
-               ;; In `direct' mode the entire image must fit, since
-               ;; `a=p,c,r' places an image at an absolute screen
-               ;; position and some terminals corrupt or scroll when
-               ;; that region overflows the window.  In `placeholder'
-               ;; mode the cells are normal text that Emacs naturally
-               ;; clips to the visible buffer area, so partial
-               ;; visibility is fine.
-               (or (eq (kitty-gfx--effective-placement-mode) 'placeholder)
-                   (<= (+ (car pos) rows -1) win-bottom)))
-          ;; Visible and fits — place if position changed
-          (let ((new-row (car pos))
-                (new-col (cdr pos)))
-            (if (and (eql new-row last-row)
-                     (eql new-col last-col))
-                (kitty-gfx--log "refresh-ov: pid=%d unchanged at row=%d col=%d"
-                                pid new-row new-col)
-              (kitty-gfx--log "refresh-ov: pid=%d moved %s -> row=%d col=%d"
-                              pid
-                              (if last-row (format "row=%d,col=%d" last-row last-col) "nil")
-                              new-row new-col)
-              ;; Sixel has no placement IDs — re-placing at a new position
-              ;; or size leaves the old pixel block on screen unless we
-              ;; explicitly erase it first.  `sixel-delete' reads OLD
-              ;; last-row/last-col/cols/rows from the overlay, so erase
-              ;; BEFORE updating the cache below (issue #13).
-              ;;
-              ;; Kitty direct mode: same-PID re-placement is supposed to
-              ;; atomically replace the old placement, but when the new
-              ;; geometry is smaller than the old one, several terminals
-              ;; (Ghostty, WezTerm) leave the cells outside the new
-              ;; rectangle painted with the old image's pixels.  Detect
-              ;; the shrink case from the per-window placement's recorded
-              ;; :cols/:rows and emit an explicit delete first so the old
-              ;; rectangle is fully cleared before the new placement
-              ;; appears.  Placeholder mode already erases inside
-              ;; `kitty-gfx--place-placeholder', so it is not covered here.
-              (when last-row
-                (let* ((old-cols (plist-get placement-data :cols))
-                       (old-rows (plist-get placement-data :rows))
-                       (shrunk (or (and old-cols (< cols old-cols))
-                                   (and old-rows (< rows old-rows)))))
-                  (cond
-                   ((eq kitty-gfx--active-backend 'sixel)
-                    (funcall (kitty-gfx--backend-fn 'delete) ov id pid))
-                   ((and (eq kitty-gfx--active-backend 'kitty)
-                         (eq (kitty-gfx--effective-placement-mode) 'direct)
-                         shrunk)
-                    ;; The terminal placement was emitted with the
-                    ;; per-window PID recorded on the overlay's
-                    ;; placement, NOT the overlay-level PID, so the
-                    ;; delete APC must address that PID.  Fall back to
-                    ;; the overlay-level PID only when no per-window
-                    ;; entry exists.
-                    (let ((win-pid (or (plist-get placement-data :pid)
-                                       pid)))
-                      (kitty-gfx--log
-                       "refresh-ov: pid=%d (win-pid=%d) shrink %dx%d -> %dx%d, delete first"
-                       pid win-pid old-cols old-rows cols rows)
-                      (funcall (kitty-gfx--backend-fn 'delete)
-                               ov id win-pid))))))
-              (overlay-put ov 'kitty-gfx-last-row new-row)
-              (overlay-put ov 'kitty-gfx-last-col new-col)
-              (kitty-gfx--record-image-placement ov win new-row new-col cols rows pid)
-              (setq placement (kitty-gfx--image-placement ov win)
-                    pid (plist-get (cdr placement) :pid))
-              (funcall (kitty-gfx--backend-fn 'place)
-                       ov id pid cols rows new-row new-col)))
-        ;; Not visible or overflows — delete if was placed in this window
-        (when placement
-          (kitty-gfx--log "refresh-ov: pid=%d hiding in win=%s (was row=%d col=%d)"
-                          pid win last-row last-col)
-          (kitty-gfx--delete-image-placement ov placement)
-          (kitty-gfx--forget-image-placement ov win)
-          (overlay-put ov 'kitty-gfx-last-row nil)
-          (overlay-put ov 'kitty-gfx-last-col nil)))))))
+      ;; Self-heal stale image ids (Kitty backend).  LRU eviction
+      ;; (`kitty-gfx--cache-put' -> cleanup -> a=d,d=I) frees the image's
+      ;; terminal-side data while overlays keep referencing the dead id;
+      ;; re-placing such an id is a silent no-op (q=2 suppresses the
+      ;; terminal's ENOENT response), leaving a permanently blank canvas.
+      ;; When the overlay's file no longer maps to its id in the cache:
+      ;; adopt the file's current id if a newer overlay re-transmitted
+      ;; it, else re-transmit under the old id.  Either way clear ALL
+      ;; placement records (data eviction killed every window's
+      ;; placement) so the place path below re-emits even at an
+      ;; unchanged position.  Sixel is excluded: it re-encodes from
+      ;; per-file temp files at place time and has no terminal-side ids.
+      (when (and band (eq kitty-gfx--active-backend 'kitty))
+        (let* ((file (overlay-get ov 'kitty-gfx-file))
+               (cached-id (and file (gethash file kitty-gfx--image-cache))))
+          (when (and file
+                     (not (eql cached-id id))
+                     (not (overlay-get ov 'kitty-gfx-heal-failed)))
+            ;; The records (and any surviving terminal placements)
+            ;; reference the stale id — clear them BEFORE the id can
+            ;; change hands below, so the delete APCs address the id
+            ;; they were actually placed under.
+            (kitty-gfx--delete-image-placements ov)
+            (setq placement nil
+                  placement-data nil
+                  last-row nil
+                  last-col nil
+                  last-src nil
+                  last-nrows nil)
+            (cond
+             (cached-id
+              (kitty-gfx--log "refresh-ov: pid=%s adopt id %s -> %s (%s)"
+                              pid id cached-id (file-name-nondirectory file))
+              (setq id cached-id)
+              (overlay-put ov 'kitty-gfx-id cached-id)
+              (kitty-gfx--cache-touch file))
+             ((and (file-exists-p file)
+                   (funcall (kitty-gfx--backend-fn 'prepare) file id))
+              (kitty-gfx--log "refresh-ov: pid=%s retransmitted evicted id=%s (%s)"
+                              pid id (file-name-nondirectory file))
+              (kitty-gfx--cache-put file id))
+             (t
+              ;; Unreadable or unconvertible file — mark it so we don't
+              ;; retry the transmit on every refresh cycle.
+              (overlay-put ov 'kitty-gfx-heal-failed t)
+              (kitty-gfx--log "refresh-ov: pid=%s heal FAILED for %s" pid file))))))
+      (let* ((term-row (nth 0 band))
+             (term-col (nth 1 band))
+             (src-row (or (nth 2 band) 0))
+             (nrows (and band
+                         (min (- rows src-row)
+                              (1+ (- win-bottom term-row)))))
+             ;; A cropped (partial) band needs the Kitty backend:
+             ;; placeholder mode crops by emitting only the visible
+             ;; cells; direct mode crops via the placement's pixel
+             ;; source rectangle, which additionally needs the image
+             ;; pixel height (`kitty-gfx-px-h').  Other backends keep
+             ;; the historical all-or-nothing rule.
+             (partial (and band (or (> src-row 0) (< nrows rows))))
+             (croppable
+              (and (eq kitty-gfx--active-backend 'kitty)
+                   (or (eq (kitty-gfx--effective-placement-mode) 'placeholder)
+                       (let ((px (overlay-get ov 'kitty-gfx-px-h)))
+                         (cond
+                          ((numberp px) (> px 0))
+                          ;; Measure only when a cropped band is actually
+                          ;; wanted (overlays predating `kitty-gfx-px-h').
+                          ;; 0 is the tried-and-failed sentinel so a
+                          ;; broken file is not re-measured every cycle.
+                          ((not partial) nil)
+                          (t (let* ((file (overlay-get ov 'kitty-gfx-file))
+                                    (dims (and file (file-exists-p file)
+                                               (kitty-gfx--image-pixel-size
+                                                file)))
+                                    (h (or (cdr-safe dims) 0)))
+                               (overlay-put ov 'kitty-gfx-px-h h)
+                               (> h 0)))))))))
+        (if (and band
+                 (<= term-row win-bottom)
+                 (> nrows 0)
+                 (or (not partial) croppable))
+            ;; Some band is visible — place if position or band changed
+            (let ((new-row term-row)
+                  (new-col term-col))
+              (if (and (eql new-row last-row)
+                       (eql new-col last-col)
+                       (eql src-row last-src)
+                       (eql nrows last-nrows))
+                  (kitty-gfx--log "refresh-ov: pid=%d unchanged at row=%d col=%d src=%d nrows=%d"
+                                  pid new-row new-col src-row nrows)
+                (kitty-gfx--log "refresh-ov: pid=%d moved %s -> row=%d col=%d src=%d nrows=%d"
+                                pid
+                                (if last-row (format "row=%d,col=%d" last-row last-col) "nil")
+                                new-row new-col src-row nrows)
+                ;; Sixel has no placement IDs — re-placing at a new position
+                ;; or size leaves the old pixel block on screen unless we
+                ;; explicitly erase it first.  `sixel-delete' reads OLD
+                ;; last-row/last-col/cols/rows from the overlay, so erase
+                ;; BEFORE updating the cache below (issue #13).
+                ;;
+                ;; Kitty direct mode: same-PID re-placement is supposed to
+                ;; atomically replace the old placement, but when the new
+                ;; geometry is smaller than the old one, several terminals
+                ;; (Ghostty, WezTerm) leave the cells outside the new
+                ;; rectangle painted with the old image's pixels.  Detect
+                ;; the shrink case from the per-window placement's recorded
+                ;; :cols/:rows and emit an explicit delete first so the old
+                ;; rectangle is fully cleared before the new placement
+                ;; appears.  Placeholder mode already erases inside
+                ;; `kitty-gfx--place-placeholder', so it is not covered here.
+                (when last-row
+                  (let* ((old-cols (plist-get placement-data :cols))
+                         (old-rows (plist-get placement-data :rows))
+                         (shrunk (or (and old-cols (< cols old-cols))
+                                     (and old-rows (< nrows old-rows)))))
+                    (cond
+                     ((eq kitty-gfx--active-backend 'sixel)
+                      (funcall (kitty-gfx--backend-fn 'delete) ov id pid))
+                     ((and (eq kitty-gfx--active-backend 'kitty)
+                           (eq (kitty-gfx--effective-placement-mode) 'direct)
+                           shrunk)
+                      ;; The terminal placement was emitted with the
+                      ;; per-window PID recorded on the overlay's
+                      ;; placement, NOT the overlay-level PID, so the
+                      ;; delete APC must address that PID.  Fall back to
+                      ;; the overlay-level PID only when no per-window
+                      ;; entry exists.
+                      (let ((win-pid (or (plist-get placement-data :pid)
+                                         pid)))
+                        (kitty-gfx--log
+                         "refresh-ov: pid=%d (win-pid=%d) shrink %dx%d -> %dx%d, delete first"
+                         pid win-pid old-cols old-rows cols nrows)
+                        (funcall (kitty-gfx--backend-fn 'delete)
+                                 ov id win-pid))))))
+                (overlay-put ov 'kitty-gfx-last-row new-row)
+                (overlay-put ov 'kitty-gfx-last-col new-col)
+                (kitty-gfx--record-image-placement ov win new-row new-col
+                                                   cols nrows pid src-row)
+                (setq placement (kitty-gfx--image-placement ov win)
+                      pid (plist-get (cdr placement) :pid))
+                (funcall (kitty-gfx--backend-fn 'place)
+                         ov id pid cols nrows new-row new-col src-row)))
+          ;; Not visible or uncroppable overflow — delete if placed here
+          (when placement
+            (kitty-gfx--log "refresh-ov: pid=%d hiding in win=%s (was row=%d col=%d)"
+                            pid win last-row last-col)
+            (kitty-gfx--delete-image-placement ov placement)
+            (kitty-gfx--forget-image-placement ov win)
+            (overlay-put ov 'kitty-gfx-last-row nil)
+            (overlay-put ov 'kitty-gfx-last-col nil))))))))
 
 (defun kitty-gfx--refresh-heading-overlay (ov win win-bottom)
   "Refresh heading overlay OV in WIN.
@@ -2482,6 +2623,46 @@ underline/color from bleeding through the overlay."
   (mapconcat (lambda (_) (propertize (make-string cols ?\s) 'face 'default))
              (number-sequence 1 rows) "\n"))
 
+(defun kitty-gfx--make-canvas (ov beg end cols rows)
+  "Reserve COLS x ROWS of blank screen space for image overlay OV.
+
+When the text in BEG..END is a single line of at least 2 characters,
+the canvas is sliced in the style of the GUI package image-slicing:
+each covered character anchors one canvas row through its own child
+overlay (collected in OV's `kitty-gfx-slices', row order).  Because
+every canvas row then has a distinct buffer position, `next-line'
+and line scrolling step through the image one row at a time, and
+`window-start' can sit mid-image — the refresh cycle draws the
+remaining band via cropped placement.  When the image has more rows
+than there are anchor characters, the surplus rows ride along in the
+last slice's display string (block-stepped, like the unsliced case).
+
+Otherwise (multi-line region, single-row image, or a 1-character
+region) a single multi-line `display' block is placed on OV itself
+and visibility is all-or-nothing, as before."
+  (let* ((len (- end beg))
+         (anchors (if (or (< len 2) (< rows 2)
+                          (string-search "\n" (buffer-substring-no-properties
+                                               beg end)))
+                      0
+                    (min len rows))))
+    (if (< anchors 2)
+        (overlay-put ov 'display
+                     (concat (kitty-gfx--make-blank-display cols rows) "\n"))
+      (let ((slices nil))
+        (dotimes (i anchors)
+          (let* ((lastp (= i (1- anchors)))
+                 (so (make-overlay (+ beg i) (if lastp end (+ beg i 1))
+                                   nil t nil))
+                 (nrows (if lastp (- rows i) 1)))
+            (overlay-put so 'display
+                         (concat (kitty-gfx--make-blank-display cols nrows)
+                                 "\n"))
+            (overlay-put so 'face 'default)
+            (overlay-put so 'kitty-gfx-slice i)
+            (push so slices)))
+        (overlay-put ov 'kitty-gfx-slices (nreverse slices))))))
+
 (defun kitty-gfx--make-overlay (beg end image-id cols rows file &optional reuse-pid)
   "Create overlay from BEG to END for image IMAGE-ID (COLS x ROWS).
 FILE is the source file path (needed by some backends for re-encoding).
@@ -2499,12 +2680,12 @@ the old placement (same PID, new dimensions/position) without a
 delete step, avoiding visual glitches in some terminals."
   (let ((ov (make-overlay beg end nil t nil))
         (pid (or reuse-pid (kitty-gfx--alloc-placement-id))))
-    ;; Always reserve screen space with blank cells.  For placeholder
+    ;; Always reserve screen space with blank cells — sliced per-row
+    ;; when possible (see `kitty-gfx--make-canvas').  For placeholder
     ;; mode the actual U+10EEEE + diacritic cells get painted on top
     ;; by `kitty-gfx--emit-placeholder-cells' during refresh (Emacs's
     ;; display engine cannot emit those combining marks itself).
-    (overlay-put ov 'display
-                 (concat (kitty-gfx--make-blank-display cols rows) "\n"))
+    (kitty-gfx--make-canvas ov beg end cols rows)
     (overlay-put ov 'face 'default)  ; override inherited faces (org-link underline etc.)
     (overlay-put ov 'kitty-gfx t)
     (overlay-put ov 'kitty-gfx-id image-id)
@@ -2523,15 +2704,29 @@ delete step, avoiding visual glitches in some terminals."
   "Return OV's recorded image placement for WIN, or nil."
   (assq win (overlay-get ov 'kitty-gfx-placements)))
 
-(defun kitty-gfx--record-image-placement (ov win row col cols rows pid)
-  "Record that OV is placed in WIN at ROW COL with COLS ROWS and PID."
-  (unless (kitty-gfx--image-placement ov win)
-    (setq pid (kitty-gfx--alloc-placement-id)))
+(defun kitty-gfx--record-image-placement (ov win row col cols rows pid
+                                             &optional src-row)
+  "Record that OV is placed in WIN at ROW COL with COLS ROWS and PID.
+ROWS counts the rows actually shown; SRC-ROW (default 0) is the first
+image cell row of that band.
+The (OV, WIN) pair keeps the placement id it was first recorded
+with: same-PID re-placement is the protocol's atomic-replace
+primitive (`a=p' with identical `i'/`p' moves the placement),
+whereas emitting a different PID creates a SECOND placement and
+the old one lives on screen as a duplicate.  An update therefore
+never adopts the caller's PID (refresh passes the overlay-level
+one); it reuses the recorded per-window id.  Only a first-time
+record allocates a fresh id."
+  (let ((existing (kitty-gfx--image-placement ov win)))
+    (setq pid (if existing
+                  (or (plist-get (cdr existing) :pid) pid)
+                (kitty-gfx--alloc-placement-id))))
   (let ((placements (assq-delete-all win (copy-sequence
                                           (overlay-get ov 'kitty-gfx-placements)))))
     (overlay-put ov 'kitty-gfx-placements
                  (cons (cons win (list :row row :col col
                                        :cols cols :rows rows
+                                       :src-row (or src-row 0)
                                        :pid pid))
                        placements))))
 
@@ -2632,6 +2827,12 @@ the next placement lands at a different position or size
       (when must-delete
         (kitty-gfx--delete-image-placements ov))
       (delete-overlay ov))
+    ;; Sliced canvases reserve space via child overlays — drop them
+    ;; with the parent or their blank rows linger in the buffer.
+    (dolist (so (overlay-get ov 'kitty-gfx-slices))
+      (when (overlay-buffer so)
+        (delete-overlay so)))
+    (overlay-put ov 'kitty-gfx-slices nil)
     (when temp-file
       (ignore-errors (delete-file temp-file)))
     (setq kitty-gfx--overlays (delq ov kitty-gfx--overlays))
@@ -2653,11 +2854,11 @@ BEG/END span the overlay region.  MAX-COLS/MAX-ROWS limit size."
          (image-id (or cached-id (kitty-gfx--alloc-id)))
          ;; Always compute dimensions fresh — they depend on max-cols/rows
          ;; which vary by display context (org inline vs image-mode vs dired).
-         (dims (let ((px (kitty-gfx--image-pixel-size abs-file)))
-                 (if px
-                     (kitty-gfx--compute-cell-dims
-                      (car px) (cdr px) max-c max-r)
-                   (cons (min 40 max-c) (min 15 max-r)))))
+         (px (kitty-gfx--image-pixel-size abs-file))
+         (dims (if px
+                   (kitty-gfx--compute-cell-dims
+                    (car px) (cdr px) max-c max-r)
+                 (cons (min 40 max-c) (min 15 max-r))))
          (cols (car dims))
          (rows (cdr dims))
          (start (or beg (point)))
@@ -2671,6 +2872,9 @@ BEG/END span the overlay region.  MAX-COLS/MAX-ROWS limit size."
     ;; Create overlay with blank space (even for cached images, dims are fresh)
     (when (or cached-id (gethash abs-file kitty-gfx--image-cache))
       (let ((ov (kitty-gfx--make-overlay start stop image-id cols rows abs-file)))
+        ;; Image pixel height enables the direct-mode source-rectangle
+        ;; crop (partial visibility) in the refresh cycle.
+        (overlay-put ov 'kitty-gfx-px-h (and px (cdr px)))
         ;; Schedule initial render (force-redisplay: new overlay's display
         ;; property must be processed before `posn-at-point' measurement).
         (kitty-gfx--schedule-refresh t)
