@@ -1979,15 +1979,27 @@ to prevent flicker."
                                     (plist-get (cdr placement) :row))
                        (overlay-put ov 'kitty-gfx-last-col
                                     (plist-get (cdr placement) :col)))))
-                 ;; Prune dead overlays (overlay-buffer returns nil)
-                 (let ((before (length kitty-gfx--overlays)))
-                   (setq kitty-gfx--overlays
-                         (cl-delete-if-not #'overlay-buffer kitty-gfx--overlays))
-                   (let ((removed (- before (length kitty-gfx--overlays))))
-                     (when (> removed 0)
-                       (cl-incf pruned removed)
-                       (kitty-gfx--log "refresh: pruned %d dead overlays from %s"
-                                       removed (buffer-name)))))
+                 ;; Prune dead overlays (overlay-buffer returns nil).
+                 ;; Deleted overlays keep their properties, and one that
+                 ;; was on screen when it died (buffer reverted, mode
+                 ;; reset, ...) still owns live terminal placements that
+                 ;; no later refresh can discover — clean them up before
+                 ;; dropping the overlay, or the image stays painted
+                 ;; forever.
+                 (let ((dead (cl-remove-if #'overlay-buffer
+                                           kitty-gfx--overlays)))
+                   (when dead
+                     (dolist (ov dead)
+                       (if (overlay-get ov 'kitty-gfx-heading)
+                           (when (overlay-get ov 'kitty-gfx-last-row)
+                             (kitty-gfx--erase-heading ov))
+                         (kitty-gfx--delete-image-placements ov)))
+                     (setq kitty-gfx--overlays
+                           (cl-remove-if-not #'overlay-buffer
+                                             kitty-gfx--overlays))
+                     (cl-incf pruned (length dead))
+                     (kitty-gfx--log "refresh: pruned %d dead overlays from %s"
+                                     (length dead) (buffer-name))))
                  (let* ((edges (window-edges win))
                         (win-bottom (nth 3 edges)))
                    (kitty-gfx--log "refresh: win=%s buf=%s overlays=%d bottom=%d"
@@ -2245,14 +2257,30 @@ then invalidates position caches and schedules a refresh."
                 ;; Image overlay — delete all terminal placements, including
                 ;; multiple windows that were showing this buffer.
                 (kitty-gfx--delete-image-placements ov))))))))
-  ;; Reset cache for visible buffers so they re-place correctly.
+  ;; Invalidate cached positions for visible buffers so they re-place
+  ;; correctly.  Keep the per-window placement records themselves —
+  ;; crucially their :pid: `kitty-gfx--record-image-placement' allocates
+  ;; a FRESH pid when a window has no record, so dropping the records
+  ;; made every post-buffer-change re-place leak the previous placement
+  ;; on the terminal (the "ghost copies" on scroll/buffer switches), and
+  ;; an overlay that went hidden before the next refresh left its image
+  ;; painted forever (no record -> the hidden branch had nothing to
+  ;; delete).  With the records kept, a visible image re-places onto the
+  ;; SAME pid (atomic replace, no ghost) and a hidden one is properly
+  ;; deleted by pid.
   ;; Heading overlays preserve cache (same rationale as on-window-change).
   (dolist (buf (buffer-list))
     (with-current-buffer buf
       (dolist (ov kitty-gfx--overlays)
         (when (and (overlay-buffer ov)
                    (not (overlay-get ov 'kitty-gfx-heading)))
-          (overlay-put ov 'kitty-gfx-placements nil)
+          (overlay-put ov 'kitty-gfx-placements
+                       (mapcar (lambda (entry)
+                                 (let ((data (copy-sequence (cdr entry))))
+                                   (setq data (plist-put data :row nil))
+                                   (setq data (plist-put data :col nil))
+                                   (cons (car entry) data)))
+                               (overlay-get ov 'kitty-gfx-placements)))
           (overlay-put ov 'kitty-gfx-last-row nil)
           (overlay-put ov 'kitty-gfx-last-col nil)))))
   ;; Longer debounce: cancel any fast leading-edge cooldown and
@@ -2563,10 +2591,16 @@ delete step, avoiding visual glitches in some terminals."
          (old-col (overlay-get ov 'kitty-gfx-last-col))
          (old-cols (overlay-get ov 'kitty-gfx-cols))
          (old-rows (overlay-get ov 'kitty-gfx-rows)))
-    (when (and id pid row col cols rows kitty-gfx--active-backend)
-      ;; Sixel deletion is position-based and reads these properties from OV;
-      ;; Kitty deletion ignores them and deletes by PID.  Temporarily bind the
-      ;; recorded geometry so both backends can share the same helper.
+    (cond
+     ;; Kitty deletes by image+placement id and ignores geometry, so a
+     ;; record whose cached :row/:col were invalidated (buffer-change
+     ;; position reset) must still reach the terminal.
+     ((and id pid (eq kitty-gfx--active-backend 'kitty))
+      (funcall (kitty-gfx--backend-fn 'delete) ov id pid))
+     ((and id pid row col cols rows kitty-gfx--active-backend)
+      ;; Sixel deletion is position-based and reads these properties from
+      ;; OV.  Temporarily bind the recorded geometry so the helper can
+      ;; share the overlay-property protocol.
       (unwind-protect
           (progn
             (overlay-put ov 'kitty-gfx-last-row row)
@@ -2577,7 +2611,7 @@ delete step, avoiding visual glitches in some terminals."
         (overlay-put ov 'kitty-gfx-last-row old-row)
         (overlay-put ov 'kitty-gfx-last-col old-col)
         (overlay-put ov 'kitty-gfx-cols old-cols)
-        (overlay-put ov 'kitty-gfx-rows old-rows)))))
+        (overlay-put ov 'kitty-gfx-rows old-rows))))))
 
 (defun kitty-gfx--delete-image-placements (ov)
   "Delete all recorded terminal placements for image overlay OV."
