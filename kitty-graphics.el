@@ -2370,6 +2370,27 @@ redisplay cost, and skips while user feedback is in the echo area."
              (not (kitty-gfx--refresh-inhibited-p)))
     (kitty-gfx--schedule-refresh)))
 
+(defun kitty-gfx--on-before-revert ()
+  "Delete terminal placements before `revert-buffer' destroys our overlays.
+Reverting re-initializes the buffer: `kill-all-local-variables' drops
+the buffer-local `kitty-gfx--overlays' list and the overlays die with
+the old buffer contents.  Any placement still on screen at that point
+would be orphaned — the fresh overlay list created after the revert
+has no record of it, so no later refresh could discover or delete it.
+Flush them to the terminal first (the revert twin of
+`kitty-gfx--kill-buffer-hook')."
+  (when kitty-gfx--overlays
+    (kitty-gfx--log "on-before-revert: cleaning %d overlays in %s"
+                    (length kitty-gfx--overlays) (buffer-name))
+    (kitty-gfx--sync-begin)
+    (unwind-protect
+        (dolist (ov kitty-gfx--overlays)
+          (if (overlay-get ov 'kitty-gfx-heading)
+              (when (overlay-get ov 'kitty-gfx-last-row)
+                (kitty-gfx--erase-heading ov))
+            (kitty-gfx--delete-image-placements ov)))
+      (kitty-gfx--sync-end))))
+
 ;;;; Image processing
 
 (defun kitty-gfx--read-file-base64 (file)
@@ -2985,7 +3006,8 @@ will render even though detection reports Sixel as supported."
   (add-hook 'window-size-change-functions #'kitty-gfx--on-window-change)
   (add-hook 'window-buffer-change-functions #'kitty-gfx--on-buffer-change)
   (add-hook 'post-command-hook #'kitty-gfx--on-redisplay)
-  (add-hook 'kill-buffer-hook #'kitty-gfx--kill-buffer-hook))
+  (add-hook 'kill-buffer-hook #'kitty-gfx--kill-buffer-hook)
+  (add-hook 'before-revert-hook #'kitty-gfx--on-before-revert))
 
 (defun kitty-gfx--uninstall-hooks ()
   "Remove redisplay hooks."
@@ -2993,7 +3015,8 @@ will render even though detection reports Sixel as supported."
   (remove-hook 'window-size-change-functions #'kitty-gfx--on-window-change)
   (remove-hook 'window-buffer-change-functions #'kitty-gfx--on-buffer-change)
   (remove-hook 'post-command-hook #'kitty-gfx--on-redisplay)
-  (remove-hook 'kill-buffer-hook #'kitty-gfx--kill-buffer-hook))
+  (remove-hook 'kill-buffer-hook #'kitty-gfx--kill-buffer-hook)
+  (remove-hook 'before-revert-hook #'kitty-gfx--on-before-revert))
 
 ;;;; Org-mode integration
 
