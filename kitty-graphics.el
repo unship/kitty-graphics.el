@@ -835,6 +835,12 @@ Most recently used at the front.")
 (defvar-local kitty-gfx--overlays nil
   "Image overlays in this buffer.")
 
+(defvar-local kitty-gfx-integrations-inhibit nil
+  "Non-nil: kitty-graphics' built-in org/shr integrations skip this buffer.
+A package that renders the buffer's images itself via
+`kitty-gfx-register-placement-overlay' sets this so the built-in
+adapters do not ALSO render them.")
+
 (defvar kitty-gfx--render-timer nil
   "Timer for deferred re-rendering.")
 
@@ -4513,6 +4519,49 @@ placements."
   (setq kitty-gfx--next-placement-id 1)
   (kitty-gfx--log "clear-all: done"))
 
+;;;###autoload
+(defun kitty-gfx-ensure-image (file &optional max-cols max-rows)
+  "Transmit FILE to the terminal (cache-aware); return (:id ID :cols C :rows R).
+C/R are the image's cell dimensions at the current cell size, capped by
+MAX-COLS (default `kitty-gfx-max-width') and MAX-ROWS (default
+`kitty-gfx-max-height').  Callers that reserve their own screen space
+use C/R to size the reservation."
+  (let* ((abs (expand-file-name file))
+         (cached (kitty-gfx--cache-get abs))
+         (id (or cached (kitty-gfx--alloc-id)))
+         (px (kitty-gfx--image-pixel-size abs))
+         (mc (or max-cols kitty-gfx-max-width))
+         (mr (or max-rows kitty-gfx-max-height))
+         (dims (if px (kitty-gfx--compute-cell-dims (car px) (cdr px) mc mr)
+                 (cons (min 40 mc) (min 15 mr)))))
+    (unless cached
+      (when (funcall (kitty-gfx--backend-fn 'prepare) abs id)
+        (kitty-gfx--cache-put abs id)))
+    (list :id id :cols (car dims) :rows (cdr dims))))
+
+;;;###autoload
+(defun kitty-gfx-register-placement-overlay (ov file cols rows)
+  "Enroll externally-reserved overlay OV for image FILE at COLS x ROWS cells.
+OV's `display' (the caller's screen-space reservation) is untouched;
+kitty-graphics records placement metadata and paints FILE at OV's
+position during refresh.  FILE is transmitted if needed.  Returns the
+`kitty-gfx-ensure-image' plist."
+  (let ((info (kitty-gfx-ensure-image file cols rows)))
+    (overlay-put ov 'kitty-gfx t)
+    (overlay-put ov 'kitty-gfx-external t)
+    (overlay-put ov 'kitty-gfx-id (plist-get info :id))
+    (overlay-put ov 'kitty-gfx-cols cols)
+    (overlay-put ov 'kitty-gfx-rows rows)
+    (overlay-put ov 'kitty-gfx-file (expand-file-name file))
+    (cl-pushnew ov kitty-gfx--overlays)
+    info))
+
+;;;###autoload
+(defun kitty-gfx-unregister-placement-overlay (ov)
+  "Remove OV from refresh bookkeeping and delete its terminal placements."
+  (kitty-gfx--delete-image-placements ov)
+  (setq kitty-gfx--overlays (delq ov kitty-gfx--overlays)))
+
 ;;;; Debug commands
 
 (defun kitty-gfx-debug-state ()
@@ -5042,7 +5091,7 @@ Relative links are resolved against the buffer file's directory (as
 org itself does for inline images), not `default-directory', which
 packages like Projectile or dired re-bind to the project root and
 would otherwise make every relative image path fail to resolve."
-  (when (derived-mode-p 'org-mode)
+  (when (and (derived-mode-p 'org-mode) (not kitty-gfx-integrations-inhibit))
     (let ((start (or beg (point-min)))
           (stop (or end (point-max)))
           (default-directory (if buffer-file-name
@@ -5541,6 +5590,8 @@ shr and org `fit' image sizing paths."
   "Around advice for `shr-put-image'.
 SPEC is an image descriptor — typically a create-image result.
 We extract the :file or :data from the image properties."
+  (if kitty-gfx-integrations-inhibit
+      (apply orig-fn spec alt args)
   (if (and kitty-graphics-mode (not (display-graphic-p)))
       (let* ((start (point))
              ;; Accept SHR's raw DATA/(DATA CONTENT-TYPE) form, with
@@ -5584,7 +5635,7 @@ We extract the :file or :data from the image properties."
                (when temp-p
                  (ignore-errors (delete-file file)))
                (kitty-gfx--log "shr-put-image error: %s" (error-message-string err)))))))
-    (apply orig-fn spec alt args)))
+    (apply orig-fn spec alt args))))
 
 ;;;; doc-view integration
 
