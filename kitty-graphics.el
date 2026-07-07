@@ -1536,19 +1536,12 @@ placeholder path as the per-window key for tracking previously-
 emitted areas, so the same overlay shown in two windows does not
 have its second window's cells erased by the first window's
 re-placement."
-  (let ((crop (and (overlayp ov) (overlay-get ov 'kitty-gfx-crop))))
-    (cond
-     ;; A source-crop overlay (e.g. one horizontal band of a sliced image)
-     ;; must use direct placement — the placeholder grid maps the WHOLE
-     ;; image, not a sub-rectangle.
-     (crop
-      (kitty-gfx--place-image image-id placement-id cols rows term-row term-col
-                              (nth 0 crop) (nth 1 crop) (nth 2 crop) (nth 3 crop)))
-     ((eq (kitty-gfx--effective-placement-mode) 'placeholder)
-      (kitty-gfx--place-placeholder ov placement-id image-id cols rows
-                                    term-row term-col))
-     (t
-      (kitty-gfx--place-image image-id placement-id cols rows term-row term-col)))))
+  (pcase (kitty-gfx--effective-placement-mode)
+    ('placeholder
+     (kitty-gfx--place-placeholder ov placement-id image-id cols rows
+                                   term-row term-col))
+    (_
+     (kitty-gfx--place-image image-id placement-id cols rows term-row term-col))))
 
 (defun kitty-gfx--place-placeholder (ov pid image-id cols rows term-row term-col)
   "Render IMAGE-ID at (TERM-ROW, TERM-COL) via Unicode placeholder cells.
@@ -3243,14 +3236,75 @@ several daemon clients on different ttys render correctly at once."
                        total-overlays placed hidden pruned)
       (kitty-gfx--update-window-signatures))))
 
+(defun kitty-gfx--clip-refresh-overlay (ov win win-bottom)
+  "Place only the visible band of a tall external inline image OV in WIN.
+OV reserves `kitty-gfx-clip-rows' (N) screen rows, one buffer position
+each, contiguously from `overlay-start'.  Rows scrolled above the window
+top are `window-start' − `overlay-start' (position arithmetic); the
+placement column is the anchor line's start column.  Neither uses
+`current-column' at a mid-image position — that would accumulate the
+reserved rows' display widths across their shared buffer line and
+staircase the placement.  A band overflowing WIN-BOTTOM is clamped, so
+the image never bleeds past the window."
+  (let* ((id (overlay-get ov 'kitty-gfx-id))
+         (cols (overlay-get ov 'kitty-gfx-cols))
+         (file (overlay-get ov 'kitty-gfx-file))
+         (beg (overlay-start ov))
+         (total (max 1 (or (overlay-get ov 'kitty-gfx-clip-rows) 1)))
+         (wstart (window-start win))
+         (wend (window-end win t))
+         (k (max 0 (min total (- (max beg wstart) beg))))   ; rows off the top
+         (first-vis (+ beg k))
+         (vp (and (< k total)
+                  (<= wstart first-vis) (<= first-vis wend)
+                  (pos-visible-in-window-p first-vis win)
+                  (not (kitty-gfx--in-folded-region-p first-vis))
+                  (posn-at-point first-vis win))))
+    (if (not vp)
+        ;; nothing visible — drop this window's placement
+        (let ((placement (kitty-gfx--image-placement ov win)))
+          (when placement
+            (kitty-gfx--delete-image-placement ov placement)
+            (kitty-gfx--forget-image-placement ov win)
+            (overlay-put ov 'kitty-gfx-last-row nil)))
+      (let* ((body (window-body-edges win))
+             (body-left (nth 0 body))
+             (body-top (nth 1 body))
+             (screen-row (+ body-top (cdr (posn-col-row vp)) 1))
+             ;; column from the anchor line's start — constant for every row
+             (anchor-col (save-excursion (goto-char beg) (current-column)))
+             (lnum (kitty-gfx--window-line-number-width win))
+             (term-col (+ body-left lnum (max 0 (- anchor-col (window-hscroll win))) 1))
+             (avail (max 1 (1+ (- win-bottom screen-row))))
+             (vis-rows (max 1 (min (- total k) avail)))
+             (px (kitty-gfx--image-pixel-size file))
+             (pw (if px (car px) cols))
+             (ph (if px (cdr px) total))
+             (band (/ (float ph) total))
+             (cy (round (* k band)))
+             (ch (max 1 (- (min ph (round (* (+ k vis-rows) band))) cy)))
+             (pid (kitty-gfx--record-image-placement
+                   ov win screen-row term-col cols vis-rows nil)))
+        (if (kitty-gfx--ensure-transmitted file id)
+            (progn
+              (kitty-gfx--place-image id pid cols vis-rows screen-row term-col
+                                      0 cy pw ch)
+              (overlay-put ov 'kitty-gfx-last-row screen-row)
+              (overlay-put ov 'kitty-gfx-last-col term-col))
+          (kitty-gfx--log "clip-refresh: id=%s deferred (transmit queued)" id))))))
+
 (defun kitty-gfx--refresh-overlay (ov win win-bottom)
   "Refresh a single overlay OV in WIN.
-WIN-BOTTOM is WIN's bottom edge.  Dispatches to heading or image
-refresh based on overlay type."
+WIN-BOTTOM is WIN's bottom edge.  Dispatches to heading, clip, doc-view,
+or plain image refresh based on overlay type."
   (if (overlay-get ov 'kitty-gfx-heading)
       ;; Heading overlay — phase 1: compute position + erase if moved.
       ;; OSC 66 emission happens in phase 2 (kitty-gfx--emit-heading-overlays).
       (kitty-gfx--refresh-heading-overlay ov win win-bottom)
+  (if (overlay-get ov 'kitty-gfx-clip)
+      ;; Externally-reserved inline image spanning N screen rows — clip to
+      ;; the visible band on scroll (see `kitty-gfx-register-placement-overlay').
+      (kitty-gfx--clip-refresh-overlay ov win win-bottom)
   (if (overlay-get ov 'kitty-gfx-doc-view)
       ;; doc-view page — own zoom/scroll/crop path (centering + clipping).
       (kitty-gfx--doc-view-refresh-overlay ov win)
@@ -3374,7 +3428,7 @@ refresh based on overlay type."
           (kitty-gfx--delete-image-placement ov placement)
           (kitty-gfx--forget-image-placement ov win)
           (overlay-put ov 'kitty-gfx-last-row nil)
-          (overlay-put ov 'kitty-gfx-last-col nil))))))))
+          (overlay-put ov 'kitty-gfx-last-col nil)))))))))
 
 (defun kitty-gfx--heading-canonical-window (buf)
   "Return the single window that renders BUF's scaled headings.
@@ -4547,29 +4601,37 @@ use C/R to size the reservation."
     (list :id id :cols (car dims) :rows (cdr dims))))
 
 ;;;###autoload
-(defun kitty-gfx-register-placement-overlay (ov file cols rows &optional crop)
+(defun kitty-gfx-register-placement-overlay (ov file cols rows)
   "Enroll externally-reserved overlay OV for image FILE at COLS x ROWS cells.
-OV's `display' (the caller's screen-space reservation) is untouched;
-kitty-graphics records placement metadata and paints FILE at OV's
-position during refresh.  FILE is transmitted if needed.
+OV reserves ROWS screen rows of space itself (via its `display'); kitty
+records placement metadata and paints FILE over them during refresh.
+FILE is transmitted if needed.
 
-CROP, when non-nil, is a source rectangle (X Y W H) in image PIXELS —
-only that part of the stored image is shown, scaled into COLS x ROWS
-cells (Kitty `x'/`y'/`w'/`h' params).  This lets a caller slice one
-transmitted image across many one-row overlays (each a horizontal
-band), so a tall image clips per row on scroll instead of vanishing
-when it does not wholly fit.  CROP forces direct placement (the
-placeholder grid cannot address a sub-rectangle).
+Refresh CLIPS a partially-visible image: when OV's top rows scroll above
+the window or its bottom past the window edge, it places a source-crop
+of just the visible band, not the whole image — so a tall inline image
+clips on scroll (like the doc-view page path) instead of vanishing (a
+whole direct placement is dropped when it does not wholly fit) or
+bleeding past the modeline (the placeholder grid does not clamp).
+
+CONTRACT: OV must reserve exactly one buffer position per screen row,
+contiguously from `overlay-start' — then the count of rows scrolled off
+the top is `window-start' − `overlay-start' (position arithmetic), and
+the placement column is the anchor line's start column.  Neither uses
+`current-column' at a mid-image position, which would accumulate the
+reserved rows' display widths across their shared buffer line and
+staircase the placement.
 
 Returns the `kitty-gfx-ensure-image' plist."
   (let ((info (kitty-gfx-ensure-image file cols rows)))
     (overlay-put ov 'kitty-gfx t)
     (overlay-put ov 'kitty-gfx-external t)
+    (overlay-put ov 'kitty-gfx-clip t)
+    (overlay-put ov 'kitty-gfx-clip-rows rows)
     (overlay-put ov 'kitty-gfx-id (plist-get info :id))
     (overlay-put ov 'kitty-gfx-cols cols)
     (overlay-put ov 'kitty-gfx-rows rows)
     (overlay-put ov 'kitty-gfx-file (expand-file-name file))
-    (when crop (overlay-put ov 'kitty-gfx-crop crop))
     (cl-pushnew ov kitty-gfx--overlays)
     info))
 
