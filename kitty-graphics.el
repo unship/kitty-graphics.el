@@ -1536,12 +1536,19 @@ placeholder path as the per-window key for tracking previously-
 emitted areas, so the same overlay shown in two windows does not
 have its second window's cells erased by the first window's
 re-placement."
-  (pcase (kitty-gfx--effective-placement-mode)
-    ('placeholder
-     (kitty-gfx--place-placeholder ov placement-id image-id cols rows
-                                   term-row term-col))
-    (_
-     (kitty-gfx--place-image image-id placement-id cols rows term-row term-col))))
+  (let ((crop (and (overlayp ov) (overlay-get ov 'kitty-gfx-crop))))
+    (cond
+     ;; A source-crop overlay (e.g. one horizontal band of a sliced image)
+     ;; must use direct placement — the placeholder grid maps the WHOLE
+     ;; image, not a sub-rectangle.
+     (crop
+      (kitty-gfx--place-image image-id placement-id cols rows term-row term-col
+                              (nth 0 crop) (nth 1 crop) (nth 2 crop) (nth 3 crop)))
+     ((eq (kitty-gfx--effective-placement-mode) 'placeholder)
+      (kitty-gfx--place-placeholder ov placement-id image-id cols rows
+                                    term-row term-col))
+     (t
+      (kitty-gfx--place-image image-id placement-id cols rows term-row term-col)))))
 
 (defun kitty-gfx--place-placeholder (ov pid image-id cols rows term-row term-col)
   "Render IMAGE-ID at (TERM-ROW, TERM-COL) via Unicode placeholder cells.
@@ -4540,12 +4547,21 @@ use C/R to size the reservation."
     (list :id id :cols (car dims) :rows (cdr dims))))
 
 ;;;###autoload
-(defun kitty-gfx-register-placement-overlay (ov file cols rows)
+(defun kitty-gfx-register-placement-overlay (ov file cols rows &optional crop)
   "Enroll externally-reserved overlay OV for image FILE at COLS x ROWS cells.
 OV's `display' (the caller's screen-space reservation) is untouched;
 kitty-graphics records placement metadata and paints FILE at OV's
-position during refresh.  FILE is transmitted if needed.  Returns the
-`kitty-gfx-ensure-image' plist."
+position during refresh.  FILE is transmitted if needed.
+
+CROP, when non-nil, is a source rectangle (X Y W H) in image PIXELS —
+only that part of the stored image is shown, scaled into COLS x ROWS
+cells (Kitty `x'/`y'/`w'/`h' params).  This lets a caller slice one
+transmitted image across many one-row overlays (each a horizontal
+band), so a tall image clips per row on scroll instead of vanishing
+when it does not wholly fit.  CROP forces direct placement (the
+placeholder grid cannot address a sub-rectangle).
+
+Returns the `kitty-gfx-ensure-image' plist."
   (let ((info (kitty-gfx-ensure-image file cols rows)))
     (overlay-put ov 'kitty-gfx t)
     (overlay-put ov 'kitty-gfx-external t)
@@ -4553,6 +4569,7 @@ position during refresh.  FILE is transmitted if needed.  Returns the
     (overlay-put ov 'kitty-gfx-cols cols)
     (overlay-put ov 'kitty-gfx-rows rows)
     (overlay-put ov 'kitty-gfx-file (expand-file-name file))
+    (when crop (overlay-put ov 'kitty-gfx-crop crop))
     (cl-pushnew ov kitty-gfx--overlays)
     info))
 
